@@ -44,7 +44,7 @@ bash huahua-node.sh
 ## What it does
 
 - **Fast sync:**
-  - downloads the latest snapshot from [snapshots.huahua.wtf](https://snapshots.huahua.wtf/latest.json), refreshed every 12 hours: a synced node in about a minute;
+  - downloads the latest snapshot from [snapshots.chihuahua.wtf](https://snapshots.chihuahua.wtf), refreshed every 12 hours: a synced node in about a minute;
   - or restores the state from the network peers with state sync.
 - **Verified downloads:** the `chihuahuad` release, cosmovisor, the genesis and the snapshot are all checked against their sha256 before use.
 - **Automatic upgrades:** cosmovisor switches the binary at the upgrade height. `huahua-node upgrade` puts the right release in place beforehand.
