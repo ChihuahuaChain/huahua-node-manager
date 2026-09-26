@@ -1,0 +1,34 @@
+name: Release
+
+# Publishes huahua-node.sh and its sha256 for a v* tag. The manager checks the
+# latest release at every start and verifies the sha256 before updating itself.
+
+on:
+  push:
+    tags:
+      - v*
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the script
+        run: |
+          bash -n huahua-node.sh
+          version=$(sed -n 's/^SCRIPT_VERSION=//p' huahua-node.sh)
+          echo "SCRIPT_VERSION=$version, tag ${GITHUB_REF_NAME}"
+          test "v$version" = "$GITHUB_REF_NAME"
+
+      - name: Checksum
+        run: sha256sum huahua-node.sh > huahua-node.sh.sha256 && cat huahua-node.sh.sha256
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            huahua-node.sh
+            huahua-node.sh.sha256

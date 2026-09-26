@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION=0.2.0
+SCRIPT_VERSION=0.3.0
 CHAIN_ID=chihuahua-1
 DENOM=uhuahua
 DAEMON=chihuahuad
@@ -13,7 +13,11 @@ REGISTRY_URL=https://raw.githubusercontent.com/cosmos/chain-registry/master/chih
 PEER_RPCS=${HUAHUA_PEER_RPCS:-https://rpc.chihuahua.wtf https://chihuahua-rpc.kleomedes.network https://rpc.chihuahua.validatus.com}
 STATESYNC_RPCS=${HUAHUA_STATESYNC_RPCS:-https://rpc.chihuahua.wtf:443,https://chihuahua-rpc.kleomedes.network:443}
 COSMOVISOR_VERSION=v1.7.1
-SELF_URL=${HUAHUA_SELF_URL:-https://raw.githubusercontent.com/ChihuahuaChain/huahua-node-manager/main/huahua-node.sh}
+SELF_REPO=ChihuahuaChain/huahua-node-manager
+# where the releases of this script are checked and downloaded (overridable for tests)
+SELF_RELEASES_API=${HUAHUA_RELEASES_API:-https://api.github.com/repos/$SELF_REPO/releases/latest}
+SELF_RELEASES_URL=${HUAHUA_RELEASES_URL:-https://github.com/$SELF_REPO/releases/download}
+SELF_URL=${HUAHUA_SELF_URL:-https://raw.githubusercontent.com/$SELF_REPO/main/huahua-node.sh}
 CONF_FILE=${HUAHUA_CONF:-$HOME/.huahua-node.env}
 SERVICE=chihuahuad
 DEFAULT_GAS_PRICE=500$DENOM
@@ -1125,17 +1129,91 @@ watch_sync() {
   return 1
 }
 
+# install_script <file>: put a copy of this script in place as the huahua-node
+# command, in /usr/local/bin or, without sudo, in ~/.local/bin
+install_script() {
+  try_root install -m 0755 "$1" /usr/local/bin/huahua-node 2>/dev/null ||
+    { mkdir -p "$HOME/.local/bin" && install -m 0755 "$1" "$HOME/.local/bin/huahua-node"; }
+}
+
 self_install() {
-  local dest=/usr/local/bin/huahua-node
   local src=$0 tmp=
   if [ ! -f "$src" ] && [ -n "$SELF_URL" ]; then
     tmp=$(mktemp); curl -fsSL "$SELF_URL" -o "$tmp" && src=$tmp
   fi
-  if [ -f "$src" ]; then
-    try_root install -m 0755 "$src" "$dest" 2>/dev/null ||
-      { mkdir -p "$HOME/.local/bin" && install -m 0755 "$src" "$HOME/.local/bin/huahua-node"; }
-  fi
+  [ -f "$src" ] && install_script "$src"
   [ -z "$tmp" ] || rm -f "$tmp"
+}
+
+script_version_of() { sed -n 's/^SCRIPT_VERSION=//p' "$1" 2>/dev/null | head -1; }
+version_gt() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ]; }
+
+# First launch (or an older copy installed): install the huahua-node command.
+ensure_installed() {
+  local cur ver
+  cur=$(command -v huahua-node 2>/dev/null || true)
+  ver=$([ -n "$cur" ] && script_version_of "$cur" || true)
+  if [ -z "$cur" ] || { [ -n "$ver" ] && version_gt "$SCRIPT_VERSION" "$ver"; }; then
+    if self_install 2>/dev/null && have huahua-node; then
+      ok "installed as $(command -v huahua-node): run ${B}huahua-node${R} from now on"
+    fi
+  fi
+}
+
+# latest_release: the version of the latest Huahua Node Manager release, empty
+# when GitHub can't be reached
+latest_release() {
+  curl -fsS --max-time 5 "$SELF_RELEASES_API" 2>/dev/null |
+    grep -o '"tag_name": *"[^"]*"' | head -1 | sed 's/.*"v\{0,1\}\([^"]*\)"$/\1/' || true
+}
+
+# self_update <version> [args]: download that release, check its sha256 and
+# the version inside, install it and restart on it with the same arguments
+self_update() {
+  local v=$1 tmp base new
+  shift
+  tmp=$(mktemp -d)
+  base=$SELF_RELEASES_URL/v$v
+  if ! curl -fsSL --max-time 60 "$base/huahua-node.sh" -o "$tmp/huahua-node.sh" ||
+    ! curl -fsSL --max-time 30 "$base/huahua-node.sh.sha256" -o "$tmp/huahua-node.sh.sha256"; then
+    warn "could not download v$v, going on with v$SCRIPT_VERSION"; rm -rf "$tmp"; return 0
+  fi
+  if ! (cd "$tmp" && sha256sum -c --status huahua-node.sh.sha256) ||
+    [ "$(script_version_of "$tmp/huahua-node.sh")" != "$v" ] || ! bash -n "$tmp/huahua-node.sh"; then
+    warn "v$v failed the checksum or version check, going on with v$SCRIPT_VERSION"; rm -rf "$tmp"; return 0
+  fi
+  install_script "$tmp/huahua-node.sh"
+  rm -rf "$tmp"
+  new=$(command -v huahua-node 2>/dev/null || true)
+  [ -n "$new" ] && [ "$(script_version_of "$new")" = "$v" ] || { warn "v$v downloaded but not installed"; return 0; }
+  ok "updated to v$v"
+  HUAHUA_NO_UPDATE=1 exec bash "$new" "$@"
+}
+
+# update_check [args]: at every start, offer the latest release when it is newer
+update_check() {
+  [ -z "${HUAHUA_NO_UPDATE:-}" ] || return 0
+  local latest
+  latest=$(latest_release)
+  [ -n "$latest" ] && version_gt "$latest" "$SCRIPT_VERSION" || return 0
+  info "Huahua Node Manager v$latest is available (this is v$SCRIPT_VERSION)"
+  if [ -n "${HUAHUA_AUTO_UPDATE:-}" ] || { [ -t 1 ] && [ -z "${HUAHUA_YES:-}" ] && has_tty && confirm "Update now?" y; }; then
+    self_update "$latest" "$@"
+  else
+    say "  update later with ${B}huahua-node update${R}"
+  fi
+}
+
+cmd_update() {
+  local latest
+  latest=$(latest_release)
+  [ -n "$latest" ] || die "could not reach GitHub to check the latest release"
+  if version_gt "$latest" "$SCRIPT_VERSION"; then
+    self_update "$latest"
+    die "the update to v$latest did not complete"
+  fi
+  ok "Huahua Node Manager v$SCRIPT_VERSION is the latest release"
+  ensure_installed
 }
 
 finish() {
@@ -1709,6 +1787,7 @@ usage: huahua-node [command]
   watch       live sync progress
   logs        follow the node logs
   upgrade     prepare the binary of the scheduled chain upgrade
+  update      update the Huahua Node Manager itself to the latest release
   validator   create the validator (key, funds, create-validator)
   uninstall   remove the node (keys are backed up first)
 
@@ -1719,6 +1798,10 @@ the defaults of the rest. Variables: SETUP_MODE (easy|advanced), NODE_ROLE
 KEEP_RECENT, PRUNE_INTERVAL, MIN_RETAIN_BLOCKS, INDEXER (null|kv), LISTEN_IP,
 PORT_OFFSET, EXTERNAL_IP, RPC_PUBLIC (yes|no), API (yes|no), MIN_GAS_PRICE,
 COSMOVISOR (yes|no), AUTO_DOWNLOAD (yes|no), COMPOSE_DIR. HUAHUA_REPLACE=1 replaces an existing node (keys are kept).
+
+At every start the manager installs itself as huahua-node if needed and checks
+for a newer release: HUAHUA_NO_UPDATE=1 skips the check, HUAHUA_AUTO_UPDATE=1
+updates without asking.
 EOF
 }
 
@@ -1729,6 +1812,10 @@ main() {
     else what=install; fi
   fi
   case $what in
+    help|-h|--help|update) ;;
+    *) ensure_installed; update_check "$@" ;;
+  esac
+  case $what in
     tui) cmd_tui ;;
     install) cmd_install ;;
     status) cmd_status ;;
@@ -1737,6 +1824,7 @@ main() {
     upgrade) shift; cmd_upgrade "$@" ;;
     validator) cmd_validator ;;
     uninstall) cmd_uninstall ;;
+    update) cmd_update ;;
     help|-h|--help) cmd_help ;;
     *) cmd_help; exit 1 ;;
   esac

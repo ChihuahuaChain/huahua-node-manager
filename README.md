@@ -159,9 +159,12 @@ It detects:
 | `huahua-node upgrade [tag [name]]` | fetch the binary of the scheduled upgrade into cosmovisor |
 | `huahua-node validator` | create the validator |
 | `huahua-node uninstall` | remove the node, backing up the keys first |
+| `huahua-node update` | update the Huahua Node Manager itself to the latest release |
 | `huahua-node help` | usage and variables |
 
-The setup installs the command as `/usr/local/bin/huahua-node`, or `~/.local/bin/huahua-node` without sudo.
+The manager installs itself as `/usr/local/bin/huahua-node` (or `~/.local/bin/huahua-node` without sudo) the first time it runs.
+
+At every start it checks the [latest release](https://github.com/ChihuahuaChain/huahua-node-manager/releases/latest). When a newer one is out it asks whether to update, then downloads it, checks its sha256 and restarts on it. `HUAHUA_NO_UPDATE=1` skips the check, and `HUAHUA_AUTO_UPDATE=1` updates without asking (for scripts). Without a terminal it only prints a notice.
 
 ## Unattended installs
 
