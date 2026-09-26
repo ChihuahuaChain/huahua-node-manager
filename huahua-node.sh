@@ -439,6 +439,7 @@ LimitNOFILE=65535
 Environment=DAEMON_NAME=$DAEMON
 Environment=DAEMON_HOME=$NODE_HOME
 Environment=DAEMON_RESTART_AFTER_UPGRADE=true
+Environment=DAEMON_SHUTDOWN_GRACE=30s
 Environment=DAEMON_ALLOW_DOWNLOAD_BINARIES=$([ "${AUTO_DOWNLOAD:-no}" = yes ] && echo true || echo false)
 Environment=UNSAFE_SKIP_BACKUP=true
 
@@ -894,6 +895,7 @@ services:
       - DAEMON_NAME=$DAEMON
       - DAEMON_HOME=$NODE_HOME
       - DAEMON_RESTART_AFTER_UPGRADE=true
+      - DAEMON_SHUTDOWN_GRACE=30s
       - DAEMON_ALLOW_DOWNLOAD_BINARIES=$([ "${AUTO_DOWNLOAD:-no}" = yes ] && echo true || echo false)
       - UNSAFE_SKIP_BACKUP=true
       - HOME=/tmp
