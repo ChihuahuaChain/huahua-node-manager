@@ -1660,7 +1660,10 @@ cmd_upgrade() {
   fetch_release "$tag" "$tmp/$DAEMON"
   ok "chihuahuad $("$tmp/$DAEMON" version 2>&1) verified"
   if [ "$COSMOVISOR" = yes ]; then
-    DAEMON_HOME=$NODE_HOME DAEMON_NAME=$DAEMON "$NODE_HOME/bin/cosmovisor" add-upgrade "$name" "$tmp/$DAEMON" --force >/dev/null
+    # what "cosmovisor add-upgrade" does, done by hand: a node adopted by huahua-node runs a cosmovisor
+    # installed somewhere else, not in $NODE_HOME/bin
+    mkdir -p "$NODE_HOME/cosmovisor/upgrades/$name/bin"
+    install -m 0755 "$tmp/$DAEMON" "$NODE_HOME/cosmovisor/upgrades/$name/bin/$DAEMON"
     ok "ready: cosmovisor switches to $tag at the upgrade height by itself"
   else
     install -m 0755 "$tmp/$DAEMON" "$NODE_HOME/bin/$DAEMON-$name"
