@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION=0.3.0
+SCRIPT_VERSION=0.3.1
 CHAIN_ID=chihuahua-1
 DENOM=uhuahua
 DAEMON=chihuahuad
