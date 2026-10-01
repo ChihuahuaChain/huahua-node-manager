@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION=0.3.1
+SCRIPT_VERSION=0.3.2
 CHAIN_ID=chihuahua-1
 DENOM=uhuahua
 DAEMON=chihuahuad
@@ -26,7 +26,7 @@ TX_GAS_PRICE=1250$DENOM
 PRESET_VARS="SETUP_MODE NODE_ROLE INSTALL_TYPE MONIKER NODE_HOME SYNC PRUNING KEEP_RECENT PRUNE_INTERVAL
   MIN_RETAIN_BLOCKS INDEXER LISTEN_IP PORT_OFFSET EXTERNAL_IP RPC_PUBLIC API MIN_GAS_PRICE COSMOVISOR
   AUTO_DOWNLOAD COMPOSE_DIR SERVICE CONTAINER NODE_BINARY KEYRING KEY_NAME P2P_PORT RPC_PORT API_PORT
-  GRPC_PORT NODE_USER NODE_PID PUBLIC_IP"
+  GRPC_PORT NODE_USER NODE_PID PUBLIC_IP AUTO_UPGRADE"
 for __v in $PRESET_VARS; do [ -n "${!__v+x}" ] && printf -v "PRESET_$__v" '%s' "${!__v}"; done
 restore_presets() {
   local v p
@@ -227,6 +227,13 @@ nd() { "$(node_bin)" "$@"; }
 local_rpc() { echo "http://127.0.0.1:${RPC_PORT:-26657}"; }
 node_flag() { echo "--node=tcp://127.0.0.1:${RPC_PORT:-26657}"; }
 rpc_status() { curl -fs --max-time 5 "$(local_rpc)/status"; }
+voting_upgrades() {
+  nd q gov proposals --proposal-status voting-period -o json "$(node_flag)" 2>/dev/null | jq -r '
+    .proposals[]? | .id as $id | .voting_end_time as $end | .messages[]?
+    | select(((.type // .["@type"]) // "") | test("MsgSoftwareUpgrade$"))
+    | (.value.plan // .plan) | select(.name)
+    | "\($id)\t\(.name)\t\(.height)\t\($end[:16] | sub("T"; " "))"' 2>/dev/null || true
+}
 
 live_peers() {
   local rpc
@@ -239,7 +246,7 @@ live_peers() {
 save_conf() {
   local v
   {
-    for v in INSTALL_TYPE NODE_ROLE MONIKER NODE_HOME SYNC COSMOVISOR AUTO_DOWNLOAD P2P_PORT RPC_PORT API_PORT GRPC_PORT \
+    for v in INSTALL_TYPE NODE_ROLE MONIKER NODE_HOME SYNC COSMOVISOR AUTO_DOWNLOAD AUTO_UPGRADE P2P_PORT RPC_PORT API_PORT GRPC_PORT \
              KEYRING KEY_NAME COMPOSE_DIR SERVICE CONTAINER NODE_BINARY; do
       printf '%s=%q\n' "$v" "${!v:-}"
     done
@@ -660,6 +667,17 @@ settings() {
       AUTO_DOWNLOAD=$AUTO_DOWNLOAD_IN
     fi
   fi
+  if [ "$COSMOVISOR" = yes ] && have systemctl; then
+    : "${AUTO_UPGRADE:=yes}"
+    if [ -n "$adv" ]; then
+      choose AUTO_UPGRADE_IN "Automatic upgrades (an hourly check prepares the upgrade scheduled by governance)" "$AUTO_UPGRADE" \
+        "yes:On  - the binary is downloaded, verified and placed in cosmovisor before the upgrade height (recommended)" \
+        "no:Off - you prepare each upgrade with \"huahua-node upgrade\""
+      AUTO_UPGRADE=$AUTO_UPGRADE_IN
+    fi
+  else
+    AUTO_UPGRADE=no
+  fi
 
   case $SYNC in snapshot|statesync) ;; *) die "invalid SYNC=$SYNC (valid: snapshot statesync)" ;; esac
 
@@ -705,6 +723,7 @@ summary() {
   indexing    $([ "$INDEXER" = kv ] && echo on || echo off)
   network     P2P $LISTEN_IP:$P2P_PORT$([ -n "${EXTERNAL_IP:-}" ] && echo " (announced as $EXTERNAL_IP:$P2P_PORT)"), RPC $([ "$RPC_PUBLIC" = yes ] && echo "$LISTEN_IP" || echo 127.0.0.1):$RPC_PORT$([ "$API" = yes ] && echo ", API :$API_PORT, gRPC :$GRPC_PORT")
   gas price   $MIN_GAS_PRICE
+  upgrades    $([ "$AUTO_UPGRADE" = yes ] && echo "automatic (hourly check, turn off with: huahua-node auto-upgrade off)" || echo "prepared by hand (huahua-node upgrade)")
 EOF
   say
   confirm "Proceed?" y || die "cancelled"
@@ -1226,7 +1245,12 @@ finish() {
   say
   say "  status          ${B}$cmd status${R}  (live progress: ${B}$cmd watch${R})"
   say "  logs            ${B}$cmd logs${R}"
-  say "  prepare upgrade ${B}$cmd upgrade${R}"
+  if [ "${AUTO_UPGRADE:-no}" = yes ]; then
+    (auto_upgrade_on) || warn "automatic upgrades could not be turned on: try again with \"$cmd auto-upgrade on\""
+    say "  upgrades        ${B}automatic${R}  (turn off: ${B}$cmd auto-upgrade off${R})"
+  else
+    say "  prepare upgrade ${B}$cmd upgrade${R}  (or automatically: ${B}$cmd auto-upgrade on${R})"
+  fi
   [ "$NODE_ROLE" = validator ] && say "  create validator ${B}$cmd validator${R}"
   say "  CLI             ${B}chihuahuad status${R}  (already pointing to this node)"
   say
@@ -1379,6 +1403,11 @@ tui_refresh() {
     T_PLAN=''
     [ -n "$T_UP" ] && T_PLAN=$(nd q upgrade plan -o json "$(node_flag)" 2>/dev/null |
       jq -r '(.plan // .) | select(.name) | "\(.name) at height \(.height)"' 2>/dev/null || true)
+    T_VOTING=''
+    [ -n "$T_UP" ] && T_VOTING=$(voting_upgrades)
+    T_AUTO=$(auto_upgrade_state)
+    T_AUTO_TIMES=''
+    [ "$T_AUTO" = on ] && T_AUTO_TIMES=$(auto_upgrade_times)
   fi
   if [ "$T_TAB" = 2 ]; then T_LOG=$(node_log_tail | tail -n 200); fi
   if [ "$T_TAB" = 1 ] && [ "${T_H:-0}" = 0 ] && [ -n "$T_UP" ]; then T_PHASE=$(statesync_phase); fi
@@ -1422,7 +1451,17 @@ tui_actions() {
       [ "$COSMOVISOR" = yes ] || ACTS+=("cosmovisor:Add cosmovisor (automatic binary switch at upgrades)")
       ACTS+=("status:Full status") ;;
     1) [ "$SYNC" = statesync ] && ACTS+=("snapshot:Restart from the snapshot") ;;
-    3) ACTS+=("upgrade:Prepare the scheduled upgrade")
+    3) if [ -z "${T_PLAN:-}" ] && [ -n "${T_VOTING:-}" ]; then
+         ACTS+=("upgrade:Prepare $(head -1 <<< "$T_VOTING" | cut -f2) in advance (proposal #$(head -1 <<< "$T_VOTING" | cut -f1) in voting)")
+       else
+         ACTS+=("upgrade:Prepare the scheduled upgrade")
+       fi
+       if [ "$COSMOVISOR" = yes ]; then
+         case ${T_AUTO:-off} in
+           on) ACTS+=("autooff:Turn automatic upgrades off") ;;
+           off) ACTS+=("autoon:Turn automatic upgrades on (hourly check)") ;;
+         esac
+       fi
        [ "$COSMOVISOR" = yes ] || ACTS+=("cosmovisor:Add cosmovisor") ;;
     4) [ "$NODE_ROLE" = validator ] || ACTS+=("validator:Create the validator (guided)") ;;
     5) ACTS+=("setup:Set up another node")
@@ -1490,7 +1529,18 @@ tui_body() {
       local prepared
       prepared=$(ls -1 "$NODE_HOME/cosmovisor/upgrades" 2>/dev/null | paste -sd' ' - || true)
       BODY+=("" "  ${D}running${R}     ${T_VER:-?}" "  ${D}scheduled${R}   ${T_PLAN:-none}")
+      local id name height end
+      while IFS=$'\t' read -r id name height end; do
+        [ -n "$id" ] && BODY+=("  ${D}in voting${R}   ${YEL}$name at height $height${R}  ${D}(proposal #$id, voting ends $end UTC)${R}")
+      done <<< "${T_VOTING:-}"
       [ "$COSMOVISOR" = yes ] && BODY+=("  ${D}prepared${R}    ${prepared:-none}  ${D}(cosmovisor/upgrades)${R}")
+      if [ "$COSMOVISOR" = yes ]; then
+        case ${T_AUTO:-off} in
+          on) BODY+=("  ${D}automatic${R}   ${GRN}on${R}  ${D}${T_AUTO_TIMES:-}${R}") ;;
+          off) BODY+=("  ${D}automatic${R}   off  ${D}(each upgrade is prepared by hand)${R}") ;;
+          *) BODY+=("  ${D}automatic${R}   unavailable  ${D}(no systemd)${R}") ;;
+        esac
+      fi
       [ "$COSMOVISOR" = yes ] || BODY+=("" "  ${YEL}without cosmovisor the binary has to be switched by hand at the upgrade height${R}") ;;
     4)
       BODY+=("" "  ${D}voting power${R}  ${T_VP:-0}"
@@ -1572,6 +1622,8 @@ tui_do() {
     status) tui_run cmd_status ;;
     snapshot) tui_run switch_to_snapshot ;;
     upgrade) tui_run cmd_upgrade ;;
+    autoon) tui_run auto_upgrade_on; T_SLOW_AT=0 ;;
+    autooff) tui_run auto_upgrade_off; T_SLOW_AT=0 ;;
     validator) tui_run cmd_validator ;;
     uninstall) tui_run cmd_uninstall ;;
     setup) tui_run tui_setup ;;
@@ -1625,6 +1677,14 @@ cmd_status() {
   say "  disk         $(du -sh "$NODE_HOME/data" 2>/dev/null | cut -f1)"
   plan=$(nd q upgrade plan -o json "$(node_flag)" 2>/dev/null | jq -r '(.plan // .) | select(.name) | "\(.name) at height \(.height)"' 2>/dev/null || true)
   if [ -n "$plan" ]; then say "  ${YEL}upgrade      $plan${R}: prepare it with \"huahua-node upgrade\""; fi
+  local id name height end
+  while IFS=$'\t' read -r id name height end; do
+    [ -n "$id" ] && say "  ${D}in voting${R}    $name at height $height (proposal #$id, voting ends $end UTC): prepare it in advance with \"huahua-node upgrade\""
+  done <<< "$(voting_upgrades)"
+  case $(auto_upgrade_state) in
+    on) say "  auto-upgrade on ($(auto_upgrade_times))" ;;
+    off) [ "$COSMOVISOR" = yes ] && say "  auto-upgrade off (turn on: huahua-node auto-upgrade on)" ;;
+  esac
 }
 
 cmd_watch() {
@@ -1637,6 +1697,136 @@ cmd_logs() {
   show_logs
 }
 
+release_for() {
+  curl -fs --max-time 15 "https://api.github.com/repos/$GITHUB_REPO/releases?per_page=50" |
+    jq -r --arg n "$1" '[.[] | select(.draft | not) | .tag_name | select(. == $n or startswith($n + "."))] | first // empty' 2>/dev/null || true
+}
+
+stage_upgrade() {
+  local tag=$1 name=$2 tmp
+  tmp=$(mktemp -d)
+  fetch_release "$tag" "$tmp/$DAEMON"
+  ok "chihuahuad $("$tmp/$DAEMON" version 2>&1) verified"
+  if [ "$COSMOVISOR" = yes ]; then
+    mkdir -p "$NODE_HOME/cosmovisor/upgrades/$name/bin"
+    install -m 0755 "$tmp/$DAEMON" "$NODE_HOME/cosmovisor/upgrades/$name/bin/$DAEMON"
+    ok "ready: cosmovisor switches to $tag at the upgrade height by itself"
+  else
+    install -m 0755 "$tmp/$DAEMON" "$NODE_HOME/bin/$DAEMON-$name"
+    warn "without cosmovisor: when the node halts at the upgrade height, replace $NODE_HOME/bin/$DAEMON with $NODE_HOME/bin/$DAEMON-$name and restart"
+  fi
+  rm -rf "$tmp"
+}
+
+AUTO_UNIT=huahua-node-upgrade-$(id -un)
+auto_upgrade_state() {
+  have systemctl || { echo unavailable; return; }
+  systemctl is-enabled "$AUTO_UNIT.timer" >/dev/null 2>&1 && echo on || echo off
+}
+auto_upgrade_times() {
+  local last next
+  last=$(systemctl show -p LastTriggerUSec --value "$AUTO_UNIT.timer" 2>/dev/null || true)
+  next=$(systemctl show -p NextElapseUSecRealtime --value "$AUTO_UNIT.timer" 2>/dev/null || true)
+  [ -n "$last" ] && [ "$last" != n/a ] && [ "$last" != 0 ] || last=never
+  [ -n "$next" ] && [ "$next" != n/a ] && [ "$next" != 0 ] || next=?
+  echo "last check $last, next $next"
+}
+
+auto_upgrade_on() {
+  load_conf
+  have systemctl || die "automatic upgrades need systemd on this machine"
+  [ "$COSMOVISOR" = yes ] || die "automatic upgrades need cosmovisor: add it first (huahua-node, tab Upgrade)"
+  local self
+  self=$(command -v huahua-node 2>/dev/null || true)
+  [ -n "$self" ] || die "install the huahua-node command first: run huahua-node once"
+  mkdir -p "$NODE_HOME/cosmovisor/upgrades" 2>/dev/null || true
+  [ -w "$NODE_HOME/cosmovisor/upgrades" ] || die "$(id -un) cannot write $NODE_HOME/cosmovisor/upgrades: run huahua-node as the user of the node (${NODE_USER:-the owner of $NODE_HOME})"
+  get_sudo || return 1
+  printf '%s\n' "[Unit]
+Description=Huahua Node Manager: prepare the scheduled Chihuahua upgrade ($(id -un))
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=$(id -un)
+Environment=HOME=$HOME
+Environment=HUAHUA_NO_UPDATE=1
+Environment=NO_COLOR=1
+ExecStart=$self auto-upgrade run" | as_root tee "/etc/systemd/system/$AUTO_UNIT.service" >/dev/null
+  printf '%s\n' "[Unit]
+Description=Huahua Node Manager: hourly check for scheduled Chihuahua upgrades ($(id -un))
+
+[Timer]
+OnBootSec=5min
+OnCalendar=hourly
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target" | as_root tee "/etc/systemd/system/$AUTO_UNIT.timer" >/dev/null
+  as_root systemctl daemon-reload
+  as_root systemctl enable -q --now "$AUTO_UNIT.timer"
+  as_root systemctl start --no-block "$AUTO_UNIT.service" || true
+  AUTO_UPGRADE=yes; [ -z "${MANAGED:-}" ] || save_conf
+  ok "automatic upgrades on: every hour the scheduled upgrade, if any, is downloaded, verified and placed in cosmovisor"
+  info "log: journalctl -u $AUTO_UNIT"
+}
+
+auto_upgrade_off() {
+  load_conf
+  if have systemctl && systemctl cat "$AUTO_UNIT.timer" >/dev/null 2>&1; then
+    get_sudo || return 1
+    as_root systemctl disable -q --now "$AUTO_UNIT.timer" 2>/dev/null || true
+    as_root rm -f "/etc/systemd/system/$AUTO_UNIT.timer" "/etc/systemd/system/$AUTO_UNIT.service"
+    as_root systemctl daemon-reload
+  fi
+  AUTO_UPGRADE=no; [ -z "${MANAGED:-}" ] || save_conf
+  ok "automatic upgrades off: prepare each upgrade with \"huahua-node upgrade\""
+}
+
+auto_upgrade_run() {
+  load_conf
+  [ "$COSMOVISOR" = yes ] || { warn "cosmovisor is off: nothing to prepare automatically"; return 0; }
+  ARCH=$(arch)
+  local plan name height tag id end
+  rpc_status >/dev/null 2>&1 || { warn "the node RPC does not answer: check again later"; return 0; }
+  plan=$(nd q upgrade plan -o json "$(node_flag)" 2>/dev/null || true)
+  name=$(jq -r '(.plan // .).name // empty' <<< "$plan" 2>/dev/null || true)
+  height=$(jq -r '(.plan // .).height // empty' <<< "$plan" 2>/dev/null || true)
+  if [ -z "$name" ]; then
+    while IFS=$'\t' read -r id name height end; do
+      [ -n "$id" ] && info "proposal #$id in voting until $end UTC: $name at height $height, prepared once it passes"
+    done <<< "$(voting_upgrades)"
+    info "no upgrade scheduled"
+    return 0
+  fi
+  if [ -x "$NODE_HOME/cosmovisor/upgrades/$name/bin/$DAEMON" ]; then
+    info "upgrade $name at height $height: already prepared"
+    return 0
+  fi
+  info "upgrade $name scheduled at height $height"
+  tag=$(release_for "$name")
+  [ -n "$tag" ] || { warn "no release found for $name yet: check again at the next run"; return 0; }
+  stage_upgrade "$tag" "$name"
+}
+
+cmd_auto_upgrade() {
+  case ${1:-status} in
+    on|enable) auto_upgrade_on ;;
+    off|disable) auto_upgrade_off ;;
+    run) auto_upgrade_run ;;
+    status)
+      local st; st=$(auto_upgrade_state)
+      case $st in
+        on) say "automatic upgrades ${GRN}on${R}: $(auto_upgrade_times)"; say "  log: journalctl -u $AUTO_UNIT" ;;
+        off) say "automatic upgrades off: turn them on with \"huahua-node auto-upgrade on\"" ;;
+        *) say "automatic upgrades unavailable: no systemd on this machine" ;;
+      esac ;;
+    *) die "usage: huahua-node auto-upgrade [on|off|status]" ;;
+  esac
+}
+
 cmd_upgrade() {
   load_conf
   ARCH=$(arch)
@@ -1644,32 +1834,27 @@ cmd_upgrade() {
   plan=$(nd q upgrade plan -o json "$(node_flag)" 2>/dev/null || true)
   name=$(jq -r '(.plan // .).name // empty' <<< "$plan" 2>/dev/null || true)
   height=$(jq -r '(.plan // .).height // empty' <<< "$plan" 2>/dev/null || true)
+  if [ -z "$name" ] && [ -z "$tag" ]; then
+    local voting id end
+    voting=$(voting_upgrades | head -1)
+    if [ -n "$voting" ]; then
+      IFS=$'\t' read -r id name height end <<< "$voting"
+      info "no upgrade scheduled yet: proposal #$id is in voting until $end UTC, $name at height $height"
+      confirm "Prepare $name in advance? It is used only if the proposal passes" y || die "cancelled"
+    fi
+  fi
   if [ -z "$name" ]; then
     [ -n "$tag" ] || die "no upgrade scheduled on chain; to install a release anyway: huahua-node upgrade <tag> <upgrade name>"
     name=${2:-} ; [ -n "$name" ] || die "give the upgrade name too: huahua-node upgrade $tag <upgrade name>"
-  else
+  elif [ -n "$(jq -r '(.plan // .).name // empty' <<< "$plan" 2>/dev/null)" ]; then
     info "upgrade $name scheduled at height $height"
   fi
   if [ -z "$tag" ]; then
-    tag=$(curl -fs "https://api.github.com/repos/$GITHUB_REPO/releases?per_page=50" |
-      jq -r --arg n "$name" '[.[] | select(.draft | not) | .tag_name | select(. == $n or startswith($n + "."))] | first // empty')
+    tag=$(release_for "$name")
     [ -n "$tag" ] || die "no release found for $name: huahua-node upgrade <tag>"
     confirm "Install release $tag for upgrade $name?" y || die "cancelled"
   fi
-  local tmp; tmp=$(mktemp -d)
-  fetch_release "$tag" "$tmp/$DAEMON"
-  ok "chihuahuad $("$tmp/$DAEMON" version 2>&1) verified"
-  if [ "$COSMOVISOR" = yes ]; then
-    # what "cosmovisor add-upgrade" does, done by hand: a node adopted by huahua-node runs a cosmovisor
-    # installed somewhere else, not in $NODE_HOME/bin
-    mkdir -p "$NODE_HOME/cosmovisor/upgrades/$name/bin"
-    install -m 0755 "$tmp/$DAEMON" "$NODE_HOME/cosmovisor/upgrades/$name/bin/$DAEMON"
-    ok "ready: cosmovisor switches to $tag at the upgrade height by itself"
-  else
-    install -m 0755 "$tmp/$DAEMON" "$NODE_HOME/bin/$DAEMON-$name"
-    warn "without cosmovisor: when the node halts at height $height, replace $NODE_HOME/bin/$DAEMON with $NODE_HOME/bin/$DAEMON-$name and restart"
-  fi
-  rm -rf "$tmp"
+  stage_upgrade "$tag" "$name"
 }
 
 cmd_validator() {
@@ -1765,6 +1950,7 @@ cmd_uninstall() {
   fi
   if [ -L /usr/local/bin/$DAEMON ]; then try_root rm -f /usr/local/bin/$DAEMON || true; fi
   rm -f "$HOME/.local/bin/$DAEMON"
+  [ "$(auto_upgrade_state)" = on ] && { (auto_upgrade_off) >/dev/null || true; }
   backup_keys
   local answer=
   tty_read answer "  Type DELETE to also delete $NODE_HOME (the keys are backed up above): " || true
@@ -1789,7 +1975,9 @@ usage: huahua-node [command]
   status      height, sync, peers, version, scheduled upgrade
   watch       live sync progress
   logs        follow the node logs
-  upgrade     prepare the binary of the scheduled chain upgrade
+  upgrade     prepare the binary of the scheduled chain upgrade (or of one in voting)
+  auto-upgrade [on|off|status]
+              hourly check that prepares the scheduled upgrade by itself
   update      update the Huahua Node Manager itself to the latest release
   validator   create the validator (key, funds, create-validator)
   uninstall   remove the node (keys are backed up first)
@@ -1800,7 +1988,7 @@ the defaults of the rest. Variables: SETUP_MODE (easy|advanced), NODE_ROLE
 (snapshot|statesync), PRUNING (pruned|default|everything|nothing|custom),
 KEEP_RECENT, PRUNE_INTERVAL, MIN_RETAIN_BLOCKS, INDEXER (null|kv), LISTEN_IP,
 PORT_OFFSET, EXTERNAL_IP, RPC_PUBLIC (yes|no), API (yes|no), MIN_GAS_PRICE,
-COSMOVISOR (yes|no), AUTO_DOWNLOAD (yes|no), COMPOSE_DIR. HUAHUA_REPLACE=1 replaces an existing node (keys are kept).
+COSMOVISOR (yes|no), AUTO_DOWNLOAD (yes|no), AUTO_UPGRADE (yes|no), COMPOSE_DIR. HUAHUA_REPLACE=1 replaces an existing node (keys are kept).
 
 At every start the manager installs itself as huahua-node if needed and checks
 for a newer release: HUAHUA_NO_UPDATE=1 skips the check, HUAHUA_AUTO_UPDATE=1
@@ -1825,6 +2013,7 @@ main() {
     watch) cmd_watch ;;
     logs) cmd_logs ;;
     upgrade) shift; cmd_upgrade "$@" ;;
+    auto-upgrade) shift; cmd_auto_upgrade "$@" ;;
     validator) cmd_validator ;;
     uninstall) cmd_uninstall ;;
     update) cmd_update ;;

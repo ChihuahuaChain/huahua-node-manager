@@ -47,7 +47,7 @@ bash huahua-node.sh
   - downloads the latest snapshot from [snapshots.chihuahua.wtf](https://snapshots.chihuahua.wtf), refreshed every 12 hours: a synced node in about a minute;
   - or restores the state from the network peers with state sync.
 - **Verified downloads:** the `chihuahuad` release, cosmovisor, the genesis and the snapshot are all checked against their sha256 before use.
-- **Automatic upgrades:** cosmovisor switches the binary at the upgrade height. `huahua-node upgrade` puts the right release in place beforehand.
+- **Automatic upgrades:** an hourly check prepares the upgrade scheduled by governance, and cosmovisor switches the binary at the upgrade height. It can be turned on and off at any time; `huahua-node upgrade` prepares an upgrade by hand, even while its proposal is still in voting.
 - **Two ways to run:** a systemd service, or a Docker container (`docker compose`, host network).
 - **Networking:**
   - finds live peers and picks free ports;
@@ -67,7 +67,7 @@ On a terminal, `huahua-node` opens a full screen dashboard. The logo and the nod
 | **1 Node** | name, type, directory, version, cosmovisor, ports, disk | start, stop, restart, add cosmovisor, full status |
 | **2 Sync** | block, network height, blocks behind, speed, progress bar, time left, state sync phase | restart from the snapshot (state sync nodes) |
 | **3 Logs** | the live node log, errors in red and warnings in yellow | |
-| **4 Upgrade** | running version, scheduled upgrade, binaries prepared for cosmovisor | prepare the scheduled upgrade |
+| **4 Upgrade** | running version, scheduled upgrade, upgrade proposals in voting, binaries prepared for cosmovisor, automatic upgrades on/off with the last and next check | prepare the scheduled upgrade (or the one in voting), turn automatic upgrades on or off |
 | **5 Validator** | voting power, active set | create the validator |
 | **6 Setup** | | set up another node, uninstall |
 
@@ -153,10 +153,11 @@ It detects:
 |---|---|
 | `huahua-node` | the dashboard on a terminal, the setup otherwise |
 | `huahua-node install` | the step by step setup |
-| `huahua-node status` | height, sync, peers, version, disk, scheduled upgrade |
+| `huahua-node status` | height, sync, peers, version, disk, scheduled upgrade, upgrade proposals in voting, automatic upgrades |
 | `huahua-node watch` | live sync progress |
 | `huahua-node logs` | follow the node log |
-| `huahua-node upgrade [tag [name]]` | fetch the binary of the scheduled upgrade into cosmovisor |
+| `huahua-node upgrade [tag [name]]` | fetch the binary of the scheduled upgrade (or of the one in voting) into cosmovisor |
+| `huahua-node auto-upgrade [on\|off\|status]` | turn the automatic upgrades on or off, or show their state |
 | `huahua-node validator` | create the validator |
 | `huahua-node uninstall` | remove the node, backing up the keys first |
 | `huahua-node update` | update the Huahua Node Manager itself to the latest release |
@@ -210,6 +211,7 @@ Setup variables:
 | `MIN_GAS_PRICE` | e.g. `500uhuahua` |
 | `COSMOVISOR` | `yes`, `no` |
 | `AUTO_DOWNLOAD` | `yes`, `no`: cosmovisor downloads upgrade binaries by itself |
+| `AUTO_UPGRADE` | `yes` (default with cosmovisor and systemd), `no`: the hourly check that prepares scheduled upgrades |
 
 Behaviour variables:
 
@@ -225,19 +227,51 @@ Behaviour variables:
 
 ## Upgrades
 
-Chain upgrades are scheduled by governance. Two steps prepare a node:
+Chain upgrades are decided by governance: a software upgrade proposal names the upgrade (for example `v10.0.0`) and the block height where it happens. When the proposal passes, the upgrade is **scheduled**. At that height every node stops, and must restart on the new `chihuahuad`.
 
-1. `huahua-node status`, and the dashboard header, show the scheduled upgrade and its height.
+With cosmovisor, the switch at the height happens by itself. The node only needs the new binary in `cosmovisor/upgrades/<name>/bin` before the height: preparing it is what the Huahua Node Manager does.
+
+### Automatic upgrades
+
+When automatic upgrades are on, a systemd timer runs `huahua-node auto-upgrade run` every hour (and 5 minutes after boot). Each run:
+
+1. asks the node whether an upgrade is scheduled;
+2. if one is, and its binary is not prepared yet, finds the matching `chihuahuad` release on GitHub, downloads it, checks its sha256 and that it runs, and places it in `cosmovisor/upgrades/<name>/bin`;
+3. if none is, only logs the upgrade proposals still in voting: nothing is installed before governance has approved it.
+
+It never restarts the node and never touches the running binary: cosmovisor still does the switch, at the height decided on chain. If the node RPC does not answer, or the release is not published yet, the run logs it and tries again an hour later.
+
+Why hourly: an expedited proposal gives only a few hours between the end of the vote and the upgrade height, so a daily check could come too late. Compared with letting cosmovisor download the binary at the height (`AUTO_DOWNLOAD`), the binary is in place and verified hours before, and the upgrade does not depend on GitHub answering at that exact moment.
+
+Turn them on or off at any time:
+
+```sh
+huahua-node auto-upgrade on       # install and start the hourly timer
+huahua-node auto-upgrade off      # remove the timer: upgrades are prepared by hand again
+huahua-node auto-upgrade status   # on or off, last and next check
+journalctl -u huahua-node-upgrade-$USER   # what each check did
+```
+
+Or from the dashboard: tab **4 Upgrade**, "Turn automatic upgrades on/off".
+
+- New nodes: the setup turns them on when the node uses cosmovisor and the machine has systemd (in the advanced setup you choose; `AUTO_UPGRADE=no` for an unattended install without them).
+- Nodes installed before 0.3.2, or adopted nodes: off until you turn them on.
+- The timer runs as the user who turned it on, who must be able to write the node directory. The units are `/etc/systemd/system/huahua-node-upgrade-<user>.{service,timer}`; `huahua-node uninstall` removes them.
+- Docker nodes: the timer runs on the host and writes into the node directory mounted in the container.
+
+### By hand
+
+1. `huahua-node status`, and the dashboard, show the scheduled upgrade and the upgrade proposals in voting.
 2. `huahua-node upgrade` does the rest:
-   - reads the upgrade name from the chain;
+   - reads the upgrade name from the chain, or from the proposal in voting when nothing is scheduled yet (it asks first: the binary is used only if the proposal passes);
    - finds the matching release, for example `v10` becomes `v10.0.0`;
    - verifies the binary and registers it with cosmovisor.
 
 At the upgrade height the node stops, cosmovisor switches the binary and the node starts again, with no one watching.
 
 ```sh
-huahua-node upgrade                    # the scheduled upgrade
-huahua-node upgrade v10.0.0 v10        # a given release for a given upgrade name
+huahua-node upgrade                    # the scheduled upgrade, or the one in voting
+huahua-node upgrade v10.0.0 v10.0.0    # a given release for a given upgrade name
 ```
 
 ## Becoming a validator
