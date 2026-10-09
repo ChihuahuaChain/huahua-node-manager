@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.3.3 (2026-10-10)
+
+### Fixes
+
+- Dashboard: the Logs tab and the state sync phase read the logs of the right container; adopted Docker nodes with a name other than `chihuahuad` showed nothing.
+- Dashboard: the network height, the data size and the chain queries run in the background. A slow or unreachable public RPC froze the interface for up to 25 seconds every 20 seconds; `du` on a large data directory did the same every 30 seconds.
+- Dashboard: the Validator tab offers "Create the validator" to a node set up as validator whose validator does not exist yet (it was keyed on the node type, not on the voting power). Same for the text menu.
+- Dashboard: Ctrl-C during an action (validator setup, upgrade, status) stops the action and comes back to the dashboard instead of quitting it. `Esc` no longer quits: a lagging arrow key over SSH was read as `Esc`.
+- Dashboard: start, stop and restart ask for the sudo password on the normal screen when it is needed, instead of a hidden prompt.
+- Dashboard: "Restart from the snapshot" asks before deleting the chain data, and is offered to any node that is catching up or stopped, not only to state sync nodes.
+- Logs: without the rights to read the system journal, `journalctl` shows nothing and no error. `huahua-node logs` and the Logs tab now use sudo in that case, and no longer call sudo every second when the journal is readable.
+- Validator: `create-validator` kept only 1 HUAHUA for the fee; at the chain's gas price the fee is a few hundred HUAHUA, so the transaction failed with a full self-delegation. The setup now keeps 600 HUAHUA aside and says so. The balance and transaction queries use the node directory and RPC port of the node (they failed with a custom directory or port). The check for an existing key no longer hides the keyring password prompt. Commission rates and the self-delegation are validated when typed. The sync wait shows the progress.
+- Setup: a replace stops the existing service or container whichever way the new node runs. The snapshot step checks the free disk before downloading. A downloaded `chihuahuad` that does not run on the machine stops the setup instead of going on with it. Setting up another node while `chihuahuad.service` (or the container) runs a node in another directory no longer overwrites it: the new node gets `chihuahuad-2`.
+- Setup: the closing summary shows the right command when `huahua-node` was installed in `~/.local/bin` outside the PATH, and the `--home` flag when the node directory is not `~/.chihuahuad`.
+- `huahua-node update` returns to the shell after the update instead of opening the dashboard.
+- `huahua-node status` prints the version and the disk even when the RPC is down; `huahua-node upgrade` says when the scheduled upgrade is already prepared. Chain queries no longer create a stray `~/.chihuahuad` when the node directory is elsewhere.
+- `huahua-node upgrade` with a prepared binary that does not run on the machine fails instead of registering it with cosmovisor.
+- Upgrade proposals: legacy `SoftwareUpgradeProposal` content (wrapped in `MsgExecLegacyContent`) is listed too.
+- The hourly upgrade timer passes the manager's configuration file to the check (`HUAHUA_CONF`).
+
+### Validator state
+
+- The dashboard header, the Validator tab and `huahua-node status` show the validator's operator address, whether it is bonded, jailed or tombstoned, and the blocks missed in the current signing window.
+- New: `huahua-node unjail`, also from the Validator tab, sends the unjail transaction once the cause of the jailing is fixed.
+
+### Upgrades
+
+- The header, the Upgrade tab and `huahua-node status` say whether the scheduled upgrade's binary is prepared, and how many blocks are left (with an estimated time when the block interval is known).
+- The text menu can turn the automatic upgrades on and off.
+
+### Other
+
+- `huahua-node version`.
+- The commands that read the node (status, dashboard, ...) install `curl` and `jq` when missing, as the setup does.
+
 ## 0.3.2 (2026-10-01)
 
 ### Automatic upgrades

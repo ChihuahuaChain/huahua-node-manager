@@ -67,8 +67,8 @@ On a terminal, `huahua-node` opens a full screen dashboard. The logo and the nod
 | **1 Node** | name, type, directory, version, cosmovisor, ports, disk | start, stop, restart, add cosmovisor, full status |
 | **2 Sync** | block, network height, blocks behind, speed, progress bar, time left, state sync phase | restart from the snapshot (state sync nodes) |
 | **3 Logs** | the live node log, errors in red and warnings in yellow | |
-| **4 Upgrade** | running version, scheduled upgrade, upgrade proposals in voting, binaries prepared for cosmovisor, automatic upgrades on/off with the last and next check | prepare the scheduled upgrade (or the one in voting), turn automatic upgrades on or off |
-| **5 Validator** | voting power, active set | create the validator |
+| **4 Upgrade** | running version, scheduled upgrade with whether its binary is prepared and the blocks left, upgrade proposals in voting, binaries prepared for cosmovisor, automatic upgrades on/off with the last and next check | prepare the scheduled upgrade (or the one in voting), turn automatic upgrades on or off |
+| **5 Validator** | operator address, state (active, not in the active set, jailed, tombstoned), voting power, missed blocks | create the validator, unjail it |
 | **6 Setup** | | set up another node, uninstall |
 
 Keys:
@@ -129,7 +129,9 @@ The setup runs in eight steps:
 
 **sudo.** The systemd service needs `sudo` once. The setup explains why and asks for the password. If `sudo` fails it offers to try again, or to run the node with Docker instead.
 
-**Replacing a node.** When the node directory already exists, the setup asks before replacing it. The keys and the node identity are kept.
+**Replacing a node.** When the node directory already exists, the setup asks before replacing it. The keys and the node identity are kept. Whatever runs that directory, service or container, is stopped first.
+
+**A second node.** When `chihuahuad.service` (or the `chihuahuad` container) already runs a node in another directory, the new node gets the next free name, `chihuahuad-2`, and the first node is left alone. The manager keeps track of one node per user, the last one set up; the others are still found when they run.
 
 ## Existing nodes
 
@@ -159,8 +161,10 @@ It detects:
 | `huahua-node upgrade [tag [name]]` | fetch the binary of the scheduled upgrade (or of the one in voting) into cosmovisor |
 | `huahua-node auto-upgrade [on\|off\|status]` | turn the automatic upgrades on or off, or show their state |
 | `huahua-node validator` | create the validator |
+| `huahua-node unjail` | unjail the validator, once the cause of the jailing is fixed |
 | `huahua-node uninstall` | remove the node, backing up the keys first |
 | `huahua-node update` | update the Huahua Node Manager itself to the latest release |
+| `huahua-node version` | print the version |
 | `huahua-node help` | usage and variables |
 
 The manager installs itself as `/usr/local/bin/huahua-node` (or `~/.local/bin/huahua-node` without sudo) the first time it runs.
@@ -219,7 +223,7 @@ Behaviour variables:
 |---|---|
 | `HUAHUA_YES=1` | take the defaults, never wait for an answer |
 | `HUAHUA_REPLACE=1` | replace an existing node directory (keys are kept) |
-| `HUAHUA_ACTION` | one action on the node found: `status`, `watch`, `logs`, `start`, `stop`, `restart`, `cosmovisor`, `upgrade`, `validator`, `uninstall`, `setup` |
+| `HUAHUA_ACTION` | one action on the node found: `status`, `watch`, `logs`, `start`, `stop`, `restart`, `cosmovisor`, `upgrade`, `auto-on`, `auto-off`, `validator`, `uninstall`, `setup` |
 | `HUAHUA_SYNC_ACTION` | when the sync stalls: `wait`, `background`, `snapshot`, `abort` |
 | `STALL_SECS` | seconds without progress before asking, default `300` |
 | `HUAHUA_PLAIN=1` | no full screen dashboard |
@@ -281,11 +285,13 @@ huahua-node upgrade v10.0.0 v10.0.0    # a given release for a given upgrade nam
 3. The guide:
    - waits for the node to be in sync;
    - creates or recovers the key, in a password protected `file` keyring in the node directory;
-   - shows the address and waits for funds;
+   - shows the address and waits for funds: at least 601 HUAHUA, 600 of which stay aside for the transaction fee (at the chain's gas price a transaction costs a few hundred HUAHUA; what is not spent stays in the account);
    - asks for the self-delegation, commission, website, identity and contact;
    - writes `validator.json`, shows the transaction and asks before broadcasting it.
 
 Back up `config/priv_validator_key.json` offline, and never run the same key on two nodes.
+
+Afterwards the dashboard header, the Validator tab and `huahua-node status` show the validator's state: active, not in the active set, jailed or tombstoned, with the blocks missed in the current signing window. A validator jailed for downtime comes back with `huahua-node unjail` (or from the Validator tab) once the node is in sync and signing again.
 
 ## Files
 

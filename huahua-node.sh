@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION=0.3.2
+SCRIPT_VERSION=0.3.3
 CHAIN_ID=chihuahua-1
 DENOM=uhuahua
 DAEMON=chihuahuad
@@ -224,15 +224,48 @@ node_bin() {
   fi
 }
 nd() { "$(node_bin)" "$@"; }
+# bin_version <binary>: the version a chihuahuad binary reports (first line,
+# whichever stream it is printed on); fails when the binary does not run
+bin_version() { local v rc=0; v=$("$1" version 2>&1) || rc=$?; printf '%s\n' "${v%%$'\n'*}"; return $rc; }
 local_rpc() { echo "http://127.0.0.1:${RPC_PORT:-26657}"; }
 node_flag() { echo "--node=tcp://127.0.0.1:${RPC_PORT:-26657}"; }
 rpc_status() { curl -fs --max-time 5 "$(local_rpc)/status"; }
+# nd_q <query...>: a chain query on this node, as JSON. The node directory is
+# given explicitly so the CLI never creates a stray ~/.chihuahuad.
+nd_q() { nd q "$@" -o json --home "$NODE_HOME" "$(node_flag)" 2>/dev/null; }
+# upgrade_plan: "<name>\t<height>" of the upgrade scheduled on chain, or nothing
+upgrade_plan() {
+  nd_q upgrade plan | jq -r '(.plan // .) | select(.name) | "\(.name)\t\(.height)"' 2>/dev/null || true
+}
+# voting_upgrades: one "<proposal id>\t<name>\t<height>\t<end of vote>" per
+# software upgrade proposal still in voting (MsgSoftwareUpgrade, or a legacy
+# SoftwareUpgradeProposal wrapped in MsgExecLegacyContent)
 voting_upgrades() {
-  nd q gov proposals --proposal-status voting-period -o json "$(node_flag)" 2>/dev/null | jq -r '
-    .proposals[]? | .id as $id | .voting_end_time as $end | .messages[]?
-    | select(((.type // .["@type"]) // "") | test("MsgSoftwareUpgrade$"))
-    | (.value.plan // .plan) | select(.name)
+  nd_q gov proposals --proposal-status voting-period | jq -r '
+    .proposals[]? | .id as $id | (.voting_end_time // "") as $end | .messages[]?
+    | [., .value?, .content?, .value?.content?] | map(select(type == "object")) | .[]
+    | select(((.type // .["@type"]) // "") | test("(MsgSoftwareUpgrade|SoftwareUpgradeProposal)$"))
+    | (.plan // .value.plan) | select(.name)
     | "\($id)\t\(.name)\t\(.height)\t\($end[:16] | sub("T"; " "))"' 2>/dev/null || true
+}
+# upgrade_prepared <name>: the binary of that upgrade is in place for cosmovisor
+upgrade_prepared() { [ -x "$NODE_HOME/cosmovisor/upgrades/$1/bin/$DAEMON" ]; }
+validator_pubkey() {
+  nd comet show-validator --home "$NODE_HOME" 2>/dev/null || nd tendermint show-validator --home "$NODE_HOME" 2>/dev/null
+}
+# validator_info: "<missed blocks>\t<tombstoned>\t<jailed>\t<status>\t<operator>"
+# for the validator signing with this node's consensus key; empty when the
+# key belongs to no validator
+validator_info() {
+  local pk key sign val
+  pk=$(validator_pubkey) || return 0
+  key=$(jq -r '.key // empty' <<< "$pk" 2>/dev/null); [ -n "$key" ] || return 0
+  val=$(nd_q staking validators --limit 1000 | jq -r --arg k "$key" '
+    .validators[]? | select(.consensus_pubkey.key == $k) | "\(.jailed)\t\(.status)\t\(.operator_address)"' 2>/dev/null || true)
+  [ -n "$val" ] || return 0
+  sign=$(nd_q slashing signing-info "$pk" | jq -r '(.val_signing_info // .) |
+    "\(.missed_blocks_counter // 0)\t\(.tombstoned // false)"' 2>/dev/null || true)
+  printf '%s\t%s\n' "${sign:-$'0\tfalse'}" "$val"
 }
 
 live_peers() {
@@ -267,7 +300,7 @@ service_ctl() {
   case $INSTALL_TYPE in
     docker)
       case $1 in
-        status) docker inspect -f '{{.State.Status}}' "$CONTAINER" 2>/dev/null || echo "not found" ;;
+        status) docker inspect -f '{{.State.Status}}' "$CONTAINER" 2>/dev/null | grep . || echo "not found" ;;
         start|restart)
           if [ -n "${COMPOSE_DIR:-}" ] && [ -f "$COMPOSE_DIR/docker-compose.yml" ]; then
             (cd "$COMPOSE_DIR" && if [ "$1" = restart ]; then docker compose restart; else docker compose up -d; fi)
@@ -366,15 +399,22 @@ node_panel() {
 }
 
 manage_menu() {
-  local running opts def
+  local running opts def st vp
   while :; do
     node_panel
-    running=''; rpc_status >/dev/null 2>&1 && running=1
+    running='' vp=0
+    if st=$(rpc_status 2>/dev/null); then running=1; vp=$(jq -r '.result.validator_info.voting_power // 0' <<< "$st"); fi
     opts=("status:Status" "watch:Sync progress" "logs:Logs (Ctrl-C to come back)")
     if [ -n "$running" ]; then opts+=("restart:Restart" "stop:Stop"); else opts+=("start:Start"); fi
     [ "$COSMOVISOR" = yes ] || opts+=("cosmovisor:Add cosmovisor (automatic binary switch at upgrades)")
     opts+=("upgrade:Prepare the next chain upgrade")
-    [ "$NODE_ROLE" = validator ] || opts+=("validator:Turn this node into a validator")
+    if [ "$COSMOVISOR" = yes ]; then
+      case $(auto_upgrade_state) in
+        on) opts+=("auto-off:Turn automatic upgrades off") ;;
+        off) opts+=("auto-on:Turn automatic upgrades on (hourly check)") ;;
+      esac
+    fi
+    [ "$vp" != 0 ] || opts+=("validator:$([ "$NODE_ROLE" = validator ] && echo "Create the validator" || echo "Turn this node into a validator")")
     [ -n "${MANAGED:-}" ] && opts+=("uninstall:Uninstall")
     opts+=("setup:Set up another node" "exit:Exit")
     MENU_ACTION=${HUAHUA_ACTION:-}; HUAHUA_ACTION=''
@@ -388,6 +428,8 @@ manage_menu() {
       start|stop|restart) service_ctl "$MENU_ACTION" && ok "$MENU_ACTION: done" || warn "$MENU_ACTION failed" ;;
       cosmovisor) add_cosmovisor || true ;;
       upgrade) (cmd_upgrade) || true ;;
+      auto-on) (auto_upgrade_on) || true ;;
+      auto-off) (auto_upgrade_off) || true ;;
       validator) (cmd_validator) || true ;;
       uninstall) cmd_uninstall; exit 0 ;;
       setup) restore_presets; return 0 ;;
@@ -398,11 +440,23 @@ manage_menu() {
   done
 }
 
+# journal <journalctl args>: read the system journal. Without the rights to
+# read it (root, or the systemd-journal/adm groups) journalctl shows nothing
+# and no error, so sudo is used in that case: without a password when it can
+# (try_root), asking for it only when the terminal is there.
+journal() {
+  local ask=''; [ "${1:-}" = --ask ] && { ask=1; shift; }
+  if [ "$(id -u)" = 0 ] || id -nG 2>/dev/null | tr ' ' '\n' | grep -qxE 'systemd-journal|adm'; then journalctl "$@"
+  elif [ -n "$ask" ]; then as_root journalctl "$@"
+  else try_root journalctl "$@"
+  fi
+}
+
 show_logs() {
   case $INSTALL_TYPE in
     docker) docker logs -f --tail 100 "$CONTAINER" ;;
     manual) warn "a node started by hand logs where it was started" ; return 1 ;;
-    *) journalctl -fu "$SERVICE" -o cat -n 100 2>/dev/null || as_root journalctl -fu "$SERVICE" -o cat -n 100 ;;
+    *) journal --ask -fu "$SERVICE" -o cat -n 100 ;;
   esac
 }
 
@@ -481,7 +535,7 @@ add_cosmovisor() {
     systemctl cat "$SERVICE" >/dev/null 2>&1 && SERVICE=chihuahuad-node
   fi
   extra=$(sed -E 's/.* start ?//; s/--home[= ][^ ]+//; s/  +/ /g; s/^ +| +$//g' <<< "${args:-} ")
-  say "  cosmovisor $COSMOVISOR_VERSION will run $("$bin" version 2>&1) from $NODE_HOME/cosmovisor"
+  say "  cosmovisor $COSMOVISOR_VERSION will run chihuahuad $(bin_version "$bin" || true) from $NODE_HOME/cosmovisor"
   case $INSTALL_TYPE in
     native) say "  the service $SERVICE is rewritten (the current one is backed up) and restarted" ;;
     manual) say "  the node (process $NODE_PID) is stopped and started again as the systemd service $SERVICE" ;;
@@ -519,9 +573,9 @@ add_cosmovisor() {
 
 install_deps() {
   local missing=() c pkgs
-  for c in curl jq lz4 tar sha256sum awk sed ss; do have "$c" || missing+=("$c"); done
-  [ ${#missing[@]} = 0 ] && { ok "tools: all present"; return; }
-  pkgs=$(printf '%s\n' "${missing[@]}" | sed 's/^sha256sum$/coreutils/; s/^ss$/iproute2/; s/^awk$/gawk/' | sort -u | tr '\n' ' ')
+  for c in curl jq lz4 tar sha256sum awk sed ss ip pgrep; do have "$c" || missing+=("$c"); done
+  [ ${#missing[@]} = 0 ] && { [ "${1:-}" = quiet ] || ok "tools: all present"; return; }
+  pkgs=$(printf '%s\n' "${missing[@]}" | sed 's/^sha256sum$/coreutils/; s/^ss$/iproute2/; s/^ip$/iproute2/; s/^pgrep$/procps/; s/^awk$/gawk/' | sort -u | tr '\n' ' ')
   warn "missing tools: ${missing[*]}"
   confirm "Install them now ($pkgs)?" y || die "install $pkgs and run again"
   if have apt-get; then
@@ -680,6 +734,7 @@ settings() {
   fi
 
   case $SYNC in snapshot|statesync) ;; *) die "invalid SYNC=$SYNC (valid: snapshot statesync)" ;; esac
+  pick_free_names
 
   OWN_PORTS=$(own_ports)
   if [ "${PORT_OFFSET:-auto}" = auto ]; then
@@ -709,6 +764,34 @@ settings() {
   : "${KEYRING:=file}" "${KEY_NAME:=wallet}"
 }
 
+# unit_home <service>: the --home of the node a systemd unit runs, if any
+unit_home() {
+  systemctl show -p ExecStart --value "$1" 2>/dev/null | sed -nE 's/.*--home[= ]([^ ;]+).*/\1/p' | head -1
+}
+# container_home <container>: the node directory a container mounts, if any
+container_home() {
+  docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$1" 2>/dev/null | sed -n 's/^DAEMON_HOME=//p' | head -1
+}
+
+# pick_free_names: when the service or container name is already taken by a
+# node in another directory, number this one (chihuahuad-2, ...) so that the
+# other node is left alone
+pick_free_names() {
+  local base n=2 h
+  if [ "$INSTALL_TYPE" = native ] && have systemctl; then
+    base=$SERVICE
+    while h=$(unit_home "$SERVICE"); [ -n "$h" ] && [ "$h" != "$NODE_HOME" ]; do SERVICE=$base-$n; n=$((n + 1)); done
+    [ "$SERVICE" = "$base" ] || warn "the service $base runs another node ($h): this one is the service $SERVICE"
+  elif [ "$INSTALL_TYPE" = docker ]; then
+    base=$CONTAINER
+    while h=$(container_home "$CONTAINER"); [ -n "$h" ] && [ "$h" != "$NODE_HOME" ]; do CONTAINER=$base-$n; n=$((n + 1)); done
+    if [ "$CONTAINER" != "$base" ]; then
+      [ "$COMPOSE_DIR" = "$HOME/chihuahua-node" ] && COMPOSE_DIR=$HOME/chihuahua-node-$((n - 1))
+      warn "the container $base runs another node ($h): this one is the container $CONTAINER ($COMPOSE_DIR)"
+    fi
+  fi
+}
+
 summary() {
   step "Summary"
   local pr=$PRUNING
@@ -736,8 +819,18 @@ check_existing() {
     warn "$NODE_HOME already contains a node"
     [ -n "${HUAHUA_REPLACE:-}" ] || confirm "Replace it? Keys and node identity are kept, the chain data is deleted" n ||
       die "cancelled"
-    if [ "$INSTALL_TYPE" = native ] && systemctl is-active -q "$SERVICE" 2>/dev/null; then as_root systemctl stop "$SERVICE"; fi
+    # stop whatever runs this directory now, whichever way the new node will
+    # run; a service or container that runs another directory is left alone
+    local h
+    if have systemctl && systemctl is-active -q "$SERVICE" 2>/dev/null; then
+      h=$(unit_home "$SERVICE")
+      if [ -z "$h" ] || [ "$h" = "$NODE_HOME" ]; then
+        info "stopping the service $SERVICE"
+        get_sudo && as_root systemctl stop "$SERVICE"
+      fi
+    fi
     if [ -f "$COMPOSE_DIR/docker-compose.yml" ]; then (cd "$COMPOSE_DIR" && docker compose down >/dev/null 2>&1) || true; fi
+    if have docker && [ "$(container_home "$CONTAINER")" = "$NODE_HOME" ]; then docker rm -f "$CONTAINER" >/dev/null 2>&1 || true; fi
     backup_keys
     wipe_chain_data
     rm -f "$NODE_HOME/config/genesis.json" "$NODE_HOME/config/config.toml" \
@@ -781,8 +874,11 @@ install_binaries() {
   info "chihuahuad $VERSION ($ARCH)"
   mkdir -p "$NODE_HOME/bin"
   fetch_release "$VERSION" "$NODE_HOME/bin/$DAEMON.download"
+  local v
+  v=$(bin_version "$NODE_HOME/bin/$DAEMON.download") ||
+    { rm -f "$NODE_HOME/bin/$DAEMON.download"; die "chihuahuad $VERSION does not run on this system: $v"; }
   mv "$NODE_HOME/bin/$DAEMON.download" "$NODE_HOME/bin/$DAEMON"
-  ok "chihuahuad $("$NODE_HOME/bin/$DAEMON" version 2>&1) verified"
+  ok "chihuahuad $v verified"
 
   if [ "$COSMOVISOR" = yes ]; then
     install_cosmovisor
@@ -862,8 +958,17 @@ wipe_chain_data() {
 restore_snapshot() {
   local meta file size sha tmp
   meta=$(curl -fs --max-time 15 "$SNAPSHOT_URL/latest.json") || die "snapshot index not reachable: $SNAPSHOT_URL/latest.json"
-  file=$(jq -r .file <<< "$meta") sha=$(jq -r .sha256 <<< "$meta") size=$(jq -r .size <<< "$meta")
+  file=$(jq -r .file <<< "$meta") sha=$(jq -r .sha256 <<< "$meta") size=$(jq -r '.size // 0' <<< "$meta")
   info "snapshot at height $(jq -r .height <<< "$meta") from $(jq -r .date <<< "$meta"), $((size / 1024 / 1024)) MiB"
+  # the archive and its extracted data live side by side for a while: the
+  # extracted state takes about twice the compressed size
+  local free_mib need_mib
+  free_mib=$(df -Pk "$NODE_HOME" 2>/dev/null | awk 'NR == 2 { printf "%d", $4 / 1024 }')
+  need_mib=$((size * 3 / 1024 / 1024))
+  if [ -n "$free_mib" ] && [ "$size" -gt 0 ] && [ "$free_mib" -lt "$need_mib" ]; then
+    warn "only $((free_mib / 1024)) GB free on $NODE_HOME: the snapshot needs about $((need_mib / 1024)) GB to download and extract"
+    confirm "Try anyway?" n || die "free some disk space and run again"
+  fi
   tmp=$NODE_HOME/snapshot.tar.lz4
   download "$SNAPSHOT_URL/$file" "$tmp" "$sha"
   ok "snapshot verified"
@@ -903,7 +1008,7 @@ write_compose() {
   else exec="$NODE_HOME/bin/$DAEMON start --home $NODE_HOME"; fi
   mkdir -p "$COMPOSE_DIR"
   cat > "$COMPOSE_DIR/docker-compose.yml" <<EOF
-name: chihuahua-node
+name: chihuahua-node${CONTAINER#chihuahuad}
 
 services:
   chihuahuad:
@@ -950,7 +1055,7 @@ install_service() {
 }
 
 firewall() {
-  local ports=("$P2P_PORT")
+  local ports=("$P2P_PORT") p
   [ "$RPC_PUBLIC" = yes ] && ports+=("$RPC_PORT")
   if have ufw && try_root ufw status 2>/dev/null | grep -q "Status: active"; then
     if confirm "ufw is active: open port(s) ${ports[*]}/tcp?" y; then
@@ -1054,9 +1159,11 @@ abort_install() {
 }
 
 node_log_tail() {
-  if [ "$INSTALL_TYPE" = docker ]; then docker logs --tail 300 chihuahuad 2>&1
-  else try_root journalctl -u "$SERVICE" -n 300 -o cat --no-pager 2>/dev/null || journalctl -u "$SERVICE" -n 300 -o cat --no-pager 2>/dev/null
-  fi | sed 's/\x1b\[[0-9;]*m//g' || true
+  case $INSTALL_TYPE in
+    docker) docker logs --tail 300 "$CONTAINER" 2>&1 ;;
+    manual) return 0 ;;
+    *) journal -u "$SERVICE" -n 300 -o cat --no-pager 2>/dev/null ;;
+  esac | sed 's/\x1b\[[0-9;]*m//g' || true
 }
 
 statesync_phase() {
@@ -1155,6 +1262,16 @@ install_script() {
     { mkdir -p "$HOME/.local/bin" && install -m 0755 "$1" "$HOME/.local/bin/huahua-node"; }
 }
 
+# self_cmd: the path of the installed huahua-node command, wherever it was
+# installed (it may be outside the PATH, in ~/.local/bin); empty if none
+self_cmd() {
+  local c
+  for c in "$(command -v huahua-node 2>/dev/null || true)" /usr/local/bin/huahua-node "$HOME/.local/bin/huahua-node"; do
+    [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; return; }
+  done
+  return 1
+}
+
 self_install() {
   local src=$0 tmp=
   if [ ! -f "$src" ] && [ -n "$SELF_URL" ]; then
@@ -1228,7 +1345,7 @@ cmd_update() {
   latest=$(latest_release)
   [ -n "$latest" ] || die "could not reach GitHub to check the latest release"
   if version_gt "$latest" "$SCRIPT_VERSION"; then
-    self_update "$latest"
+    self_update "$latest" update
     die "the update to v$latest did not complete"
   fi
   ok "Huahua Node Manager v$SCRIPT_VERSION is the latest release"
@@ -1238,8 +1355,11 @@ cmd_update() {
 finish() {
   save_conf
   self_install || true
-  local cmd=huahua-node
-  have huahua-node || cmd="bash $0"
+  local cmd
+  if have huahua-node; then cmd=huahua-node
+  elif cmd=$(self_cmd); then :
+  elif [ -f "$0" ]; then cmd="bash $0"
+  else cmd="huahua-node"; fi
   say
   say "${B}${GRN}Your Chihuahua node is up. Woof woof!${R}"
   say
@@ -1252,7 +1372,11 @@ finish() {
     say "  prepare upgrade ${B}$cmd upgrade${R}  (or automatically: ${B}$cmd auto-upgrade on${R})"
   fi
   [ "$NODE_ROLE" = validator ] && say "  create validator ${B}$cmd validator${R}"
-  say "  CLI             ${B}chihuahuad status${R}  (already pointing to this node)"
+  if [ "$NODE_HOME" = "$HOME/.chihuahuad" ]; then say "  CLI             ${B}chihuahuad status${R}  (already pointing to this node)"
+  else say "  CLI             ${B}chihuahuad status --home $NODE_HOME${R}"; fi
+  case $cmd in
+    "$HOME"/.local/bin/*) info "add ~/.local/bin to the PATH to run it as \"huahua-node\": export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
+  esac
   say
   if [ "$NODE_ROLE" = validator ]; then
     warn "back up $NODE_HOME/config/priv_validator_key.json somewhere safe and offline"
@@ -1356,9 +1480,10 @@ read_key() {
   IFS= read -rsn1 -t "${1:-1}" k || { KEY=''; return; }
   case $k in
     $'\e')
-      IFS= read -rsn2 -t 0.02 rest || true
+      # the rest of an escape sequence may lag behind over a slow link
+      IFS= read -rsn2 -t 0.1 rest || true
       case $rest in
-        '[A') KEY=up ;; '[B') KEY=down ;; '[C') KEY=right ;; '[D') KEY=left ;; '[Z') KEY=btab ;;
+        '[A'|'OA') KEY=up ;; '[B'|'OB') KEY=down ;; '[C'|'OC') KEY=right ;; '[D'|'OD') KEY=left ;; '[Z') KEY=btab ;;
         '') KEY=esc ;;
         *) IFS= read -rsn5 -t 0.01 rest || true; KEY='' ;;
       esac ;;
@@ -1368,9 +1493,28 @@ read_key() {
   esac
 }
 
+# Slow lookups (the network height, the size of the data, chain queries) run
+# in the background and leave their output in $T_TMP/<key>, picked up at the
+# next frame: the interface never waits for a slow network or a cold disk.
+declare -A T_BG T_BG_PID
+tui_bg() {
+  local key=$1; shift
+  kill -0 "${T_BG_PID[$key]:-}" 2>/dev/null && return 0
+  ( "$@" > "$T_TMP/$key.tmp" 2>/dev/null; mv -f "$T_TMP/$key.tmp" "$T_TMP/$key" ) &
+  T_BG_PID[$key]=$!
+}
+tui_bg_collect() {
+  local k
+  for k in "${!T_BG_PID[@]}"; do
+    [ -f "$T_TMP/$k" ] && { T_BG[$k]=$(<"$T_TMP/$k"); rm -f "$T_TMP/$k"; }
+  done
+}
+tui_disk() { du -sh "$NODE_HOME/data" 2>/dev/null | cut -f1; }
+
 tui_refresh() {
   local now; now=$(date +%s)
   if [ -z "${T_NODE:-}" ]; then return; fi
+  tui_bg_collect
   if [ $((now - ${T_ST_AT:-0})) -ge 2 ]; then
     T_ST_AT=$now
     T_SVC=$(service_ctl status 2>/dev/null || true)
@@ -1395,22 +1539,43 @@ tui_refresh() {
       T_UP='' T_ST='' T_PEERS=0
     fi
   fi
-  if [ $((now - ${T_NET_AT:-0})) -ge 20 ]; then T_NET_AT=$now; T_NET=$(network_height || echo 0); fi
+  if [ $((now - ${T_NET_AT:-0})) -ge 20 ]; then T_NET_AT=$now; tui_bg net network_height; fi
+  T_NET=${T_BG[net]:-0}; [[ $T_NET =~ ^[0-9]+$ ]] || T_NET=0
   if [ $((now - ${T_SLOW_AT:-0})) -ge 30 ]; then
     T_SLOW_AT=$now
-    T_DISK=$(du -sh "$NODE_HOME/data" 2>/dev/null | cut -f1)
-    T_VER=$(nd version 2>/dev/null | head -1)
-    T_PLAN=''
-    [ -n "$T_UP" ] && T_PLAN=$(nd q upgrade plan -o json "$(node_flag)" 2>/dev/null |
-      jq -r '(.plan // .) | select(.name) | "\(.name) at height \(.height)"' 2>/dev/null || true)
-    T_VOTING=''
-    [ -n "$T_UP" ] && T_VOTING=$(voting_upgrades)
+    tui_bg disk tui_disk
+    T_VER=$(bin_version "$(node_bin)" 2>/dev/null || true)
+    if [ -n "$T_UP" ]; then
+      tui_bg plan upgrade_plan
+      tui_bg voting voting_upgrades
+      if [ "${T_VP:-0}" != 0 ] || [ "$NODE_ROLE" = validator ]; then tui_bg val validator_info; else T_BG[val]=''; fi
+    else
+      T_BG[plan]='' T_BG[voting]='' T_BG[val]=''
+    fi
     T_AUTO=$(auto_upgrade_state)
     T_AUTO_TIMES=''
     [ "$T_AUTO" = on ] && T_AUTO_TIMES=$(auto_upgrade_times)
   fi
-  if [ "$T_TAB" = 2 ]; then T_LOG=$(node_log_tail | tail -n 200); fi
-  if [ "$T_TAB" = 1 ] && [ "${T_H:-0}" = 0 ] && [ -n "$T_UP" ]; then T_PHASE=$(statesync_phase); fi
+  T_DISK=${T_BG[disk]:-}
+  T_PLAN_NAME=${T_BG[plan]%%$'\t'*} T_PLAN_HEIGHT=${T_BG[plan]#*$'\t'}
+  T_PLAN=''; [ -n "${T_BG[plan]:-}" ] && T_PLAN="$T_PLAN_NAME at height $T_PLAN_HEIGHT"
+  T_VOTING=${T_BG[voting]:-}
+  IFS=$'\t' read -r T_V_MISSED T_V_TOMB T_V_JAILED T_V_STATUS T_V_OPER <<< "${T_BG[val]:-}"
+  if [ "$T_TAB" = 2 ] && [ $((now - ${T_LOG_AT:-0})) -ge 2 ]; then T_LOG_AT=$now; T_LOG=$(node_log_tail | tail -n 200); fi
+  if [ "$T_TAB" = 1 ] && [ "${T_H:-0}" = 0 ] && [ -n "$T_UP" ] && [ $((now - ${T_PHASE_AT:-0})) -ge 2 ]; then
+    T_PHASE_AT=$now; T_PHASE=$(statesync_phase)
+  fi
+}
+
+# upgrade_eta: "in N blocks (~time)" for the scheduled upgrade, from the
+# measured block interval when there is one
+upgrade_eta() {
+  local left
+  [ -n "${T_PLAN_HEIGHT:-}" ] && [ "${T_H:-0}" -gt 0 ] || return 0
+  left=$((T_PLAN_HEIGHT - T_H))
+  [ "$left" -gt 0 ] || { echo "height reached"; return; }
+  if [ "${T_BINT:-0}" -gt 0 ]; then echo "in $left blocks (~$(fmt_duration $((left * T_BINT / 10))))"
+  else echo "in $left blocks"; fi
 }
 
 tui_header() {
@@ -1428,14 +1593,22 @@ tui_header() {
   H_LINES+=("${B}$MONIKER${R}  ${D}·${R}  $([ "$NODE_ROLE" = validator ] && echo validator || echo "full node")  ${D}·${R}  $how")
   if [ -n "${T_UP:-}" ]; then
     sync="${GRN}in sync${R}"
-    [ "$T_CATCH" = false ] || sync="${YEL}catching up${R}"
+    if [ "$T_CATCH" != false ]; then
+      sync="${YEL}catching up${R}"
+      [ "${T_NET:-0}" -gt "$T_H" ] && sync+=" ${D}($((T_NET - T_H)) behind)${R}"
+    fi
     [ "$T_H" = 0 ] && sync="${YEL}state sync${R}"
     H_LINES+=("${GRN}●${R} running   block ${B}$T_H${R}   $sync   ${T_PEERS} peers")
   else
     H_LINES+=("${RED}●${R} ${T_SVC:-stopped}")
   fi
   H_LINES+=("${D}${T_VER:-} · cosmovisor $([ "$COSMOVISOR" = yes ] && echo on || echo off) · ${T_DISK:-?} · $NODE_HOME${R}")
-  [ -n "${T_PLAN:-}" ] && H_LINES+=("${YEL}upgrade ${T_PLAN}${R}")
+  if [ -n "${T_PLAN:-}" ]; then
+    if [ "$COSMOVISOR" != yes ]; then H_LINES+=("${YEL}upgrade ${T_PLAN}: switch the binary by hand at that height${R}")
+    elif upgrade_prepared "$T_PLAN_NAME"; then H_LINES+=("${YEL}upgrade ${T_PLAN}${R} ${GRN}prepared${R} ${D}$(upgrade_eta)${R}")
+    else H_LINES+=("${YEL}upgrade ${T_PLAN}${R} ${RED}not prepared${R}: open ${B}Upgrade${R} ${D}$(upgrade_eta)${R}"); fi
+  fi
+  if [ "${T_V_JAILED:-false}" = true ]; then H_LINES+=("${RED}validator jailed${R}: open ${B}Validator${R}"); fi
 }
 
 tui_actions() {
@@ -1450,7 +1623,9 @@ tui_actions() {
       else ACTS+=("start:Start the node"); fi
       [ "$COSMOVISOR" = yes ] || ACTS+=("cosmovisor:Add cosmovisor (automatic binary switch at upgrades)")
       ACTS+=("status:Full status") ;;
-    1) [ "$SYNC" = statesync ] && ACTS+=("snapshot:Restart from the snapshot") ;;
+    1) if [ "$SYNC" = statesync ] || [ -z "${T_UP:-}" ] || [ "${T_CATCH:-}" != false ]; then
+         ACTS+=("snapshot:Restart from the latest snapshot (deletes the chain data)")
+       fi ;;
     3) if [ -z "${T_PLAN:-}" ] && [ -n "${T_VOTING:-}" ]; then
          ACTS+=("upgrade:Prepare $(head -1 <<< "$T_VOTING" | cut -f2) in advance (proposal #$(head -1 <<< "$T_VOTING" | cut -f1) in voting)")
        else
@@ -1463,7 +1638,8 @@ tui_actions() {
          esac
        fi
        [ "$COSMOVISOR" = yes ] || ACTS+=("cosmovisor:Add cosmovisor") ;;
-    4) [ "$NODE_ROLE" = validator ] || ACTS+=("validator:Create the validator (guided)") ;;
+    4) if [ -n "${T_V_OPER:-}" ]; then [ "${T_V_JAILED:-}" = true ] && ACTS+=("unjail:Unjail the validator")
+       elif [ -n "${T_UP:-}" ] && [ "${T_VP:-0}" = 0 ]; then ACTS+=("validator:Create the validator (guided)"); fi ;;
     5) ACTS+=("setup:Set up another node")
        [ -n "${MANAGED:-}" ] && ACTS+=("uninstall:Uninstall this node")
        ACTS+=("quit:Exit") ;;
@@ -1505,7 +1681,7 @@ tui_body() {
         [ "$net" -gt "${T_HFIRST:-0}" ] && [ "$behind" -gt 0 ] && pct=$(( (T_H - T_HFIRST) * 100 / (net - T_HFIRST) ))
         age=$(( $(date +%s) - $(date -d "$T_BTIME" +%s 2>/dev/null || date +%s) ))
         BODY+=("  $([ "$T_CATCH" = false ] && echo "${GRN}● in sync${R}" || echo "${YEL}${SPIN} catching up${R}")" ""
-          "  ${D}block${R}        $T_H" "  ${D}network${R}      ${net:-?}  ($behind behind)"
+          "  ${D}block${R}        $T_H" "  ${D}network${R}      $([ "$net" -gt 0 ] && echo "$net  ($behind behind)" || echo "?  ${D}(no public RPC reachable)${R}")"
           "  $([ "$T_CATCH" = false ] && echo "${D}last block${R}   ${age}s ago" || echo "${D}processing${R}   blocks from $(fmt_duration "$age") ago")"
           "  ${D}speed${R}        $(if [ -z "${T_RATE:-}" ]; then echo "–  (measuring)"; elif [ "$T_CATCH" = false ] && [ "${T_BINT:-0}" -ge 10 ]; then echo "a block every $((T_BINT / 10)).$((T_BINT % 10))s"; else echo "$((T_RATE / 10)).$((T_RATE % 10)) blocks/s"; fi)"
           "  ${D}peers${R}        ${T_PEERS}")
@@ -1515,7 +1691,13 @@ tui_body() {
         fi
       fi ;;
     2)
-      if [ -z "${T_LOG:-}" ]; then BODY+=("" "  ${D}no log lines (the journal may need: sudo usermod -aG systemd-journal $(id -un))${R}")
+      if [ -z "${T_LOG:-}" ]; then
+        case $INSTALL_TYPE in
+          manual) BODY+=("" "  ${D}a node started by hand logs where it was started${R}") ;;
+          docker) BODY+=("" "  ${D}no log lines yet (docker logs $CONTAINER)${R}") ;;
+          *) BODY+=("" "  ${D}no log lines: reading the journal may need the systemd-journal group${R}"
+               "  ${D}sudo usermod -aG systemd-journal $(id -un), then log in again${R}") ;;
+        esac
       else
         while IFS= read -r l; do
           case $l in
@@ -1526,9 +1708,13 @@ tui_body() {
         done < <(tail -n "$h" <<< "$T_LOG")
       fi ;;
     3)
-      local prepared
+      local prepared sched
       prepared=$(ls -1 "$NODE_HOME/cosmovisor/upgrades" 2>/dev/null | paste -sd' ' - || true)
-      BODY+=("" "  ${D}running${R}     ${T_VER:-?}" "  ${D}scheduled${R}   ${T_PLAN:-none}")
+      if [ -z "${T_PLAN:-}" ]; then sched=none
+      elif [ "$COSMOVISOR" != yes ]; then sched="${YEL}$T_PLAN${R}  ${D}$(upgrade_eta)${R}"
+      elif upgrade_prepared "$T_PLAN_NAME"; then sched="${YEL}$T_PLAN${R}  ${GRN}prepared${R}  ${D}$(upgrade_eta)${R}"
+      else sched="${YEL}$T_PLAN${R}  ${RED}not prepared${R}  ${D}$(upgrade_eta)${R}"; fi
+      BODY+=("" "  ${D}running${R}     ${T_VER:-?}" "  ${D}scheduled${R}   $sched")
       local id name height end
       while IFS=$'\t' read -r id name height end; do
         [ -n "$id" ] && BODY+=("  ${D}in voting${R}   ${YEL}$name at height $height${R}  ${D}(proposal #$id, voting ends $end UTC)${R}")
@@ -1543,12 +1729,27 @@ tui_body() {
       fi
       [ "$COSMOVISOR" = yes ] || BODY+=("" "  ${YEL}without cosmovisor the binary has to be switched by hand at the upgrade height${R}") ;;
     4)
-      BODY+=("" "  ${D}voting power${R}  ${T_VP:-0}"
-        "  ${D}status${R}        $([ "${T_VP:-0}" != 0 ] && echo "${GRN}active validator${R}" || echo "not in the active set")")
-      [ "$NODE_ROLE" = validator ] || BODY+=("" "  ${D}the node must be in sync; the account needs HUAHUA for the self-delegation and fees${R}") ;;
+      if [ -n "${T_V_OPER:-}" ]; then
+        local vstate
+        if [ "${T_V_JAILED:-}" = true ]; then vstate="${RED}jailed${R}  ${D}(unjail it once the cause is fixed)${R}"
+        elif [ "${T_VP:-0}" != 0 ]; then vstate="${GRN}active, signing blocks${R}"
+        else case ${T_V_STATUS:-} in
+            *BONDED) vstate="${YEL}bonded, but this node has no voting power${R}  ${D}(is another node signing with this key?)${R}" ;;
+            *) vstate="${YEL}not in the active set${R}  ${D}(not enough stake)${R}" ;;
+          esac
+        fi
+        BODY+=("" "  ${D}validator${R}      $T_V_OPER" "  ${D}state${R}          $vstate"
+          "  ${D}voting power${R}   ${T_VP:-0}"
+          "  ${D}missed blocks${R}  ${T_V_MISSED:-0}  ${D}(in the current signing window)${R}")
+        [ "${T_V_TOMB:-false}" = true ] && BODY+=("  ${RED}tombstoned: this consensus key can never validate again${R}")
+      else
+        BODY+=("" "  ${D}voting power${R}  ${T_VP:-0}" "  ${D}status${R}        not a validator")
+        [ -n "${T_UP:-}" ] || BODY+=("" "  ${YEL}the node is not running${R}")
+        BODY+=("" "  ${D}the node must be in sync; the account needs HUAHUA for the self-delegation and fees${R}")
+      fi ;;
     5)
       BODY+=("" "  ${D}commands without this interface:${R}"
-        "  huahua-node status | watch | logs | upgrade | validator | uninstall") ;;
+        "  huahua-node status | watch | logs | upgrade | auto-upgrade | validator | uninstall | update") ;;
   esac
 }
 
@@ -1598,11 +1799,25 @@ tui_draw() {
 tui_run() {
   tui_leave
   printf '\e[H\e[2J%s\n\n' "${B}${YEL}huahua-node${R} ${D}·${R} ${ACT_LABEL:-$1}"
+  # Ctrl-C stops the action (the subshell gets the default handler), not the dashboard
+  trap ':' INT
   ( set -Eeuo pipefail; trap 'die "failed at line $LINENO: $BASH_COMMAND"' ERR; "$@" ) && T_MSG="done" || T_MSG="${YEL}not completed${R}"
   printf '\n%s' "${D}press enter to go back${R}"
   IFS= read -rs _ < /dev/tty || true
+  trap 'exit 0' INT
   tui_enter
   tui_find
+}
+
+# the TUI has no visible cursor: an action that may ask for the sudo
+# password runs on the normal screen
+needs_sudo_prompt() { [ "$INSTALL_TYPE" = native ] && [ "$(id -u)" != 0 ] && ! sudo -n true 2>/dev/null; }
+
+confirm_snapshot() {
+  warn "this stops the node, deletes its chain data and restores the latest snapshot from $SNAPSHOT_URL"
+  confirm "Continue?" n || die "cancelled"
+  if [ "$INSTALL_TYPE" != docker ]; then get_sudo || return 1; fi
+  switch_to_snapshot
 }
 
 tui_find() {
@@ -1615,16 +1830,20 @@ tui_do() {
   case $1 in
     quit) exit 0 ;;
     start|stop|restart)
-      T_MSG="$1…"; tui_draw
-      if service_ctl "$1" >/dev/null 2>&1; then T_MSG="$1: done"; else T_MSG="${RED}$1 failed${R}"; fi
+      if needs_sudo_prompt; then tui_run service_ctl "$1"
+      else
+        T_MSG="$1…"; tui_draw
+        if service_ctl "$1" >/dev/null 2>&1; then T_MSG="$1: done"; else T_MSG="${RED}$1 failed${R}"; fi
+      fi
       T_ST_AT=0 ;;
     cosmovisor) tui_run add_cosmovisor ;;
     status) tui_run cmd_status ;;
-    snapshot) tui_run switch_to_snapshot ;;
+    snapshot) tui_run confirm_snapshot ;;
     upgrade) tui_run cmd_upgrade ;;
     autoon) tui_run auto_upgrade_on; T_SLOW_AT=0 ;;
     autooff) tui_run auto_upgrade_off; T_SLOW_AT=0 ;;
     validator) tui_run cmd_validator ;;
+    unjail) tui_run cmd_unjail; T_SLOW_AT=0 ;;
     uninstall) tui_run cmd_uninstall ;;
     setup) tui_run tui_setup ;;
   esac
@@ -1638,7 +1857,8 @@ cmd_tui() {
   T_TAB=0 T_SEL=0 T_MSG='' SPIN='⠋'
   [ -n "$T_NODE" ] || T_TAB=5
   local frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏) f=0
-  trap 'tui_leave' EXIT
+  T_TMP=$(mktemp -d)
+  trap 'tui_leave; rm -rf "$T_TMP"' EXIT
   trap 'exit 0' INT TERM
   trap - ERR
   set +eu
@@ -1657,27 +1877,34 @@ cmd_tui() {
       down|j) T_SEL=$((T_SEL + 1)); tui_actions; [ "$T_SEL" -lt "${#ACTS[@]}" ] || T_SEL=$((${#ACTS[@]} > 0 ? ${#ACTS[@]} - 1 : 0)) ;;
       enter) tui_actions; [ ${#ACTS[@]} -gt 0 ] && { ACT_LABEL=${ACTS[T_SEL]#*:}; tui_do "${ACTS[T_SEL]%%:*}"; } ;;
       r) T_ST_AT=0 T_NET_AT=0 T_SLOW_AT=0 ;;
-      q|Q|esc) exit 0 ;;
+      q|Q) exit 0 ;;
     esac
   done
 }
 
 cmd_status() {
   load_conf
-  local st peers plan
+  local st peers up=''
   say "${B}$MONIKER${R} ($NODE_ROLE, $INSTALL_TYPE): $(service_ctl status)"
-  st=$(rpc_status) || die "the node RPC does not answer on $(local_rpc)"
-  peers=$(curl -fs --max-time 5 "$(local_rpc)/net_info" | jq -r .result.n_peers)
-  jq -r --arg peers "$peers" '.result as $r |
-    "  height       \($r.sync_info.latest_block_height) (\($r.sync_info.latest_block_time[:19] | sub("T"; " ")) UTC)",
-    "  in sync      \(if $r.sync_info.catching_up then "no, catching up" else "yes" end)",
-    "  peers        \($peers)",
-    "  voting power \($r.validator_info.voting_power)"' <<< "$st"
-  say "  version      $(nd version 2>/dev/null || echo "not readable by $(id -un)")"
+  if st=$(rpc_status 2>/dev/null); then
+    up=1
+    peers=$(curl -fs --max-time 5 "$(local_rpc)/net_info" 2>/dev/null | jq -r '.result.n_peers // "?"' 2>/dev/null || echo "?")
+    jq -r --arg peers "$peers" '.result as $r |
+      "  height       \($r.sync_info.latest_block_height) (\($r.sync_info.latest_block_time[:19] | sub("T"; " ")) UTC)",
+      "  in sync      \(if $r.sync_info.catching_up then "no, catching up" else "yes" end)",
+      "  peers        \($peers)",
+      "  voting power \($r.validator_info.voting_power)"' <<< "$st"
+  fi
+  say "  version      $(bin_version "$(node_bin)" 2>/dev/null || echo "not readable by $(id -un)")"
   say "  disk         $(du -sh "$NODE_HOME/data" 2>/dev/null | cut -f1)"
-  plan=$(nd q upgrade plan -o json "$(node_flag)" 2>/dev/null | jq -r '(.plan // .) | select(.name) | "\(.name) at height \(.height)"' 2>/dev/null || true)
-  if [ -n "$plan" ]; then say "  ${YEL}upgrade      $plan${R}: prepare it with \"huahua-node upgrade\""; fi
+  [ -n "$up" ] || die "the node RPC does not answer on $(local_rpc): is the node running? (huahua-node logs)"
   local id name height end
+  IFS=$'\t' read -r name height <<< "$(upgrade_plan)"
+  if [ -n "$name" ]; then
+    if [ "$COSMOVISOR" != yes ]; then say "  ${YEL}upgrade      $name at height $height${R}: switch the binary by hand at that height"
+    elif upgrade_prepared "$name"; then say "  ${YEL}upgrade      $name at height $height${R}: ${GRN}prepared${R}, cosmovisor switches at the height"
+    else say "  ${YEL}upgrade      $name at height $height${R}: ${RED}not prepared${R}, run \"huahua-node upgrade\""; fi
+  fi
   while IFS=$'\t' read -r id name height end; do
     [ -n "$id" ] && say "  ${D}in voting${R}    $name at height $height (proposal #$id, voting ends $end UTC): prepare it in advance with \"huahua-node upgrade\""
   done <<< "$(voting_upgrades)"
@@ -1685,6 +1912,15 @@ cmd_status() {
     on) say "  auto-upgrade on ($(auto_upgrade_times))" ;;
     off) [ "$COSMOVISOR" = yes ] && say "  auto-upgrade off (turn on: huahua-node auto-upgrade on)" ;;
   esac
+  local missed tomb jailed status oper
+  IFS=$'\t' read -r missed tomb jailed status oper <<< "$(validator_info)"
+  if [ -n "${oper:-}" ]; then
+    say "  validator    $oper"
+    if [ "$jailed" = true ]; then say "  ${RED}jailed${R}       unjail with \"huahua-node unjail\" once the cause is fixed"
+    else say "  missed       $missed blocks in the current signing window"; fi
+    [ "$tomb" = true ] && say "  ${RED}tombstoned${R}   this consensus key can never validate again"
+  fi
+  return 0
 }
 
 cmd_watch() {
@@ -1703,10 +1939,12 @@ release_for() {
 }
 
 stage_upgrade() {
-  local tag=$1 name=$2 tmp
+  local tag=$1 name=$2 tmp v
   tmp=$(mktemp -d)
   fetch_release "$tag" "$tmp/$DAEMON"
-  ok "chihuahuad $("$tmp/$DAEMON" version 2>&1) verified"
+  v=$(bin_version "$tmp/$DAEMON") || { rm -rf "$tmp"; die "the chihuahuad of release $tag does not run on this system: $v"; }
+  [[ $v == *"${tag#v}"* ]] || warn "the binary reports version $v, the release is $tag"
+  ok "chihuahuad $v verified"
   if [ "$COSMOVISOR" = yes ]; then
     mkdir -p "$NODE_HOME/cosmovisor/upgrades/$name/bin"
     install -m 0755 "$tmp/$DAEMON" "$NODE_HOME/cosmovisor/upgrades/$name/bin/$DAEMON"
@@ -1737,8 +1975,7 @@ auto_upgrade_on() {
   have systemctl || die "automatic upgrades need systemd on this machine"
   [ "$COSMOVISOR" = yes ] || die "automatic upgrades need cosmovisor: add it first (huahua-node, tab Upgrade)"
   local self
-  self=$(command -v huahua-node 2>/dev/null || true)
-  [ -n "$self" ] || die "install the huahua-node command first: run huahua-node once"
+  self=$(self_cmd) || die "install the huahua-node command first: run huahua-node once"
   mkdir -p "$NODE_HOME/cosmovisor/upgrades" 2>/dev/null || true
   [ -w "$NODE_HOME/cosmovisor/upgrades" ] || die "$(id -un) cannot write $NODE_HOME/cosmovisor/upgrades: run huahua-node as the user of the node (${NODE_USER:-the owner of $NODE_HOME})"
   get_sudo || return 1
@@ -1751,6 +1988,7 @@ Wants=network-online.target
 Type=oneshot
 User=$(id -un)
 Environment=HOME=$HOME
+Environment=HUAHUA_CONF=$CONF_FILE
 Environment=HUAHUA_NO_UPDATE=1
 Environment=NO_COLOR=1
 ExecStart=$self auto-upgrade run" | as_root tee "/etc/systemd/system/$AUTO_UNIT.service" >/dev/null
@@ -1789,11 +2027,9 @@ auto_upgrade_run() {
   load_conf
   [ "$COSMOVISOR" = yes ] || { warn "cosmovisor is off: nothing to prepare automatically"; return 0; }
   ARCH=$(arch)
-  local plan name height tag id end
+  local name height tag id end
   rpc_status >/dev/null 2>&1 || { warn "the node RPC does not answer: check again later"; return 0; }
-  plan=$(nd q upgrade plan -o json "$(node_flag)" 2>/dev/null || true)
-  name=$(jq -r '(.plan // .).name // empty' <<< "$plan" 2>/dev/null || true)
-  height=$(jq -r '(.plan // .).height // empty' <<< "$plan" 2>/dev/null || true)
+  IFS=$'\t' read -r name height <<< "$(upgrade_plan)"
   if [ -z "$name" ]; then
     while IFS=$'\t' read -r id name height end; do
       [ -n "$id" ] && info "proposal #$id in voting until $end UTC: $name at height $height, prepared once it passes"
@@ -1830,11 +2066,11 @@ cmd_auto_upgrade() {
 cmd_upgrade() {
   load_conf
   ARCH=$(arch)
-  local plan name height tag=${1:-}
-  plan=$(nd q upgrade plan -o json "$(node_flag)" 2>/dev/null || true)
-  name=$(jq -r '(.plan // .).name // empty' <<< "$plan" 2>/dev/null || true)
-  height=$(jq -r '(.plan // .).height // empty' <<< "$plan" 2>/dev/null || true)
-  if [ -z "$name" ] && [ -z "$tag" ]; then
+  local name height tag=${1:-} scheduled=''
+  rpc_status >/dev/null 2>&1 || warn "the node RPC does not answer: the scheduled upgrade cannot be read from the chain"
+  IFS=$'\t' read -r name height <<< "$(upgrade_plan)"
+  [ -n "$name" ] && scheduled=1
+  if [ -z "$name" ] && [ -z "${2:-}" ]; then
     local voting id end
     voting=$(voting_upgrades | head -1)
     if [ -n "$voting" ]; then
@@ -1846,8 +2082,12 @@ cmd_upgrade() {
   if [ -z "$name" ]; then
     [ -n "$tag" ] || die "no upgrade scheduled on chain; to install a release anyway: huahua-node upgrade <tag> <upgrade name>"
     name=${2:-} ; [ -n "$name" ] || die "give the upgrade name too: huahua-node upgrade $tag <upgrade name>"
-  elif [ -n "$(jq -r '(.plan // .).name // empty' <<< "$plan" 2>/dev/null)" ]; then
+  elif [ -n "$scheduled" ]; then
     info "upgrade $name scheduled at height $height"
+    if [ "$COSMOVISOR" = yes ] && upgrade_prepared "$name"; then
+      info "already prepared: $NODE_HOME/cosmovisor/upgrades/$name/bin/$DAEMON ($(bin_version "$NODE_HOME/cosmovisor/upgrades/$name/bin/$DAEMON" || true))"
+      confirm "Download it again?" n || return 0
+    fi
   fi
   if [ -z "$tag" ]; then
     tag=$(release_for "$name")
@@ -1857,27 +2097,70 @@ cmd_upgrade() {
   stage_upgrade "$tag" "$name"
 }
 
+# HUAHUA kept aside for the fee of the create-validator transaction: about
+# 300k gas at the TX_GAS_PRICE, with a margin
+VALIDATOR_FEE_RESERVE=600
+
+# key_exists: the key is in the keyring. A file keyring stores one <name>.info
+# per key, so no password is needed to look; other backends ask through the CLI.
+key_exists() {
+  if [ "$KEYRING" = file ]; then [ -f "$NODE_HOME/keyring-file/$KEY_NAME.info" ]
+  else nd keys show "$KEY_NAME" --keyring-backend "$KEYRING" --home "$NODE_HOME" -a >/dev/null 2>&1 < /dev/tty; fi
+}
+
+# wait_tx <hash>: wait for the transaction to be in a block, up to a minute;
+# prints its code (0 on success)
+wait_tx() {
+  local i code
+  for i in $(seq 1 12); do
+    sleep 5
+    code=$(nd_q tx "$1" | jq -r '.code // empty' 2>/dev/null || true)
+    [ -n "$code" ] && { echo "$code"; return 0; }
+  done
+  echo ""
+}
+
+# broadcast <tx args...>: show the command, ask, sign (the keyring password is
+# asked on the terminal), wait for the block
+broadcast() {
+  local cmd=("$@") out hash code
+  say; say "  ${D}chihuahuad ${cmd[*]}${R}"
+  confirm "Broadcast this transaction?" n || { info "not sent: the command above does it"; return 1; }
+  out=$(nd "${cmd[@]}" -y -o json < /dev/tty) || die "transaction failed"
+  hash=$(jq -r .txhash <<< "$out") code=$(jq -r .code <<< "$out")
+  [ "$code" = 0 ] || die "transaction rejected: $(jq -r .raw_log <<< "$out")"
+  info "tx $hash sent, waiting for the block"
+  code=$(wait_tx "$hash")
+  case $code in
+    0) return 0 ;;
+    '') warn "the transaction is not in a block yet: check it later with \"chihuahuad q tx $hash $(node_flag)\""; return 1 ;;
+    *) warn "the transaction failed on chain (code $code): chihuahuad q tx $hash $(node_flag)"; return 1 ;;
+  esac
+}
+
 cmd_validator() {
   load_conf
   ARCH=$(arch)
   local st
   st=$(rpc_status) || die "the node RPC does not answer: is the node running?"
-  if [ "$(jq -r .result.sync_info.catching_up <<< "$st")" != false ]; then
-    info "waiting for the node to be in sync"
-    until [ "$(rpc_status | jq -r .result.sync_info.catching_up)" = false ]; do sleep 10; done
-  fi
-  ok "node in sync"
   if [ "$(jq -r .result.validator_info.voting_power <<< "$st")" != 0 ]; then
     ok "this node is already an active validator"; return
+  fi
+  if [ "$(jq -r .result.sync_info.catching_up <<< "$st")" != false ]; then
+    info "the validator can be created once the node is in sync"
+    watch_sync 86400 || die "the node is not in sync yet: run \"huahua-node validator\" again later"
+  else
+    ok "node in sync at block $(jq -r .result.sync_info.latest_block_height <<< "$st")"
   fi
 
   say; say "${B}Validator key${R} (keyring: $KEYRING, in $NODE_HOME)"
   local kr=(--keyring-backend "$KEYRING" --home "$NODE_HOME")
-  if nd keys show "$KEY_NAME" "${kr[@]}" -a >/dev/null 2>&1 < /dev/tty; then
+  if key_exists; then
     ok "using the existing key \"$KEY_NAME\""
   else
     choose KEY_ACTION "The account that creates and funds the validator" new \
       "new:create a new key" "recover:recover a key from its mnemonic"
+    info "the keyring is protected by a password: choose one (8 characters or more), it is asked at every transaction"
     if [ "$KEY_ACTION" = recover ]; then nd keys add "$KEY_NAME" --recover "${kr[@]}" < /dev/tty
     else
       warn "write the mnemonic down offline: it is the only way to recover the account"
@@ -1885,30 +2168,43 @@ cmd_validator() {
     fi
   fi
   local addr bal
-  addr=$(nd keys show "$KEY_NAME" -a "${kr[@]}" < /dev/tty)
-  save_conf
+  addr=$(nd keys show "$KEY_NAME" -a "${kr[@]}" < /dev/tty) || die "cannot read the key \"$KEY_NAME\""
+  [ -z "${MANAGED:-}" ] || save_conf
+  local min=$(( (VALIDATOR_FEE_RESERVE + 1) * 1000000 ))
   while :; do
-    bal=$(nd q bank balances "$addr" -o json 2>/dev/null | jq -r --arg d "$DENOM" '[.balances[] | select(.denom == $d) | .amount | tonumber] | add // 0')
+    bal=$(nd_q bank balances "$addr" | jq -r --arg d "$DENOM" '[.balances[]? | select(.denom == $d) | .amount | tonumber] | add // 0' 2>/dev/null || echo 0)
+    [[ $bal =~ ^[0-9]+$ ]] || bal=0
     say "  address  ${B}$addr${R}"
     say "  balance  $(awk -v b="$bal" 'BEGIN { printf "%.6f", b / 1e6 }') HUAHUA"
-    [ "$bal" -gt 1000000 ] && break
+    [ "$bal" -ge "$min" ] && break
+    info "at least $((VALIDATOR_FEE_RESERVE + 1)) HUAHUA are needed: 1 or more to stake, and up to $VALIDATOR_FEE_RESERVE for the transaction fee"
     confirm "Send HUAHUA to this address, then check again?" y || die "fund $addr and run: huahua-node validator"
   done
 
   say; say "${B}Validator details${R}"
-  local max_stake=$(( (bal - 1000000) / 1000000 ))
-  ask STAKE "Self-delegation in HUAHUA (max $max_stake):" "$max_stake"
+  local max_stake=$(( (bal - VALIDATOR_FEE_RESERVE * 1000000) / 1000000 ))
+  while :; do
+    ask STAKE "Self-delegation in HUAHUA (1 to $max_stake, the rest stays for the fee):" "$max_stake"
+    [[ $STAKE =~ ^[0-9]+$ ]] && [ "$STAKE" -ge 1 ] && [ "$STAKE" -le "$max_stake" ] && break
+    warn "a whole number between 1 and $max_stake"; STAKE=''
+  done
   ask V_WEBSITE "Website (optional):" ""
   ask V_IDENTITY "Keybase identity for the logo (optional):" ""
   ask V_CONTACT "Security contact email (optional):" ""
   ask V_DETAILS "Description (optional):" ""
-  ask V_RATE "Commission rate:" 0.05
-  ask V_MAX_RATE "Maximum commission rate:" 0.20
-  ask V_MAX_CHANGE "Maximum daily commission change:" 0.01
-  [[ $STAKE =~ ^[0-9]+$ ]] && [ "$STAKE" -ge 1 ] && [ "$STAKE" -le "$max_stake" ] || die "invalid self-delegation: $STAKE"
+  local rate_re='^(0|0?\.[0-9]+|1(\.0+)?)$'
+  while :; do
+    ask V_RATE "Commission rate (0.05 = 5%):" 0.05
+    ask V_MAX_RATE "Maximum commission rate:" 0.20
+    ask V_MAX_CHANGE "Maximum daily commission change:" 0.01
+    [[ $V_RATE =~ $rate_re && $V_MAX_RATE =~ $rate_re && $V_MAX_CHANGE =~ $rate_re ]] &&
+      awk -v r="$V_RATE" -v m="$V_MAX_RATE" -v c="$V_MAX_CHANGE" 'BEGIN { exit !(r <= m && c <= m) }' && break
+    warn "rates are numbers between 0 and 1; the rate and the daily change cannot exceed the maximum rate"
+    V_RATE='' V_MAX_RATE='' V_MAX_CHANGE=''
+  done
 
   local vj=$NODE_HOME/config/validator.json pubkey
-  pubkey=$(nd comet show-validator --home "$NODE_HOME" 2>/dev/null || nd tendermint show-validator --home "$NODE_HOME")
+  pubkey=$(validator_pubkey) || die "cannot read the consensus key of the node"
   jq -n --argjson pubkey "$pubkey" --arg amount "$((STAKE * 1000000))$DENOM" --arg moniker "$MONIKER" \
     --arg identity "$V_IDENTITY" --arg website "$V_WEBSITE" --arg security "$V_CONTACT" --arg details "$V_DETAILS" \
     --arg rate "$V_RATE" --arg max "$V_MAX_RATE" --arg change "$V_MAX_CHANGE" \
@@ -1916,23 +2212,30 @@ cmd_validator() {
       security: $security, details: $details, "commission-rate": $rate, "commission-max-rate": $max,
       "commission-max-change-rate": $change, "min-self-delegation": "1"}' > "$vj"
   say; jq . "$vj" | sed 's/^/  /'
-  local cmd=(tx staking create-validator "$vj" --from "$KEY_NAME" --chain-id "$CHAIN_ID" "${kr[@]}"
-             --gas auto --gas-adjustment 1.5 --gas-prices "$TX_GAS_PRICE" --node "$(local_rpc)")
-  say; say "  ${D}chihuahuad ${cmd[*]}${R}"
-  confirm "Broadcast the create-validator transaction?" n || { info "not sent: the command above creates the validator"; return; }
-  local out
-  out=$(nd "${cmd[@]}" -y -o json < /dev/tty) || die "transaction failed"
-  local hash code
-  hash=$(jq -r .txhash <<< "$out") code=$(jq -r .code <<< "$out")
-  [ "$code" = 0 ] || die "transaction rejected: $(jq -r .raw_log <<< "$out")"
-  info "tx $hash sent, waiting for the block"
-  sleep 12
-  if [ "$(nd q tx "$hash" -o json 2>/dev/null | jq -r .code)" = 0 ]; then
+  if broadcast tx staking create-validator "$vj" --from "$KEY_NAME" --chain-id "$CHAIN_ID" "${kr[@]}" \
+      --gas auto --gas-adjustment 1.3 --gas-prices "$TX_GAS_PRICE" --node "$(local_rpc)"; then
     ok "validator created: it signs blocks once its stake is in the active set"
-  else
-    warn "check the transaction: chihuahuad q tx $hash"
   fi
   warn "back up $NODE_HOME/config/priv_validator_key.json offline, and never run the same key on two nodes"
+}
+
+# cmd_unjail: send MsgUnjail from the validator account, once the cause of
+# the jailing (downtime, usually) is fixed
+cmd_unjail() {
+  load_conf
+  local missed tomb jailed status oper
+  rpc_status >/dev/null 2>&1 || die "the node RPC does not answer: is the node running?"
+  IFS=$'\t' read -r missed tomb jailed status oper <<< "$(validator_info)"
+  [ -n "${oper:-}" ] || die "this node's consensus key belongs to no validator"
+  [ "$tomb" != true ] || die "the validator is tombstoned (double signing): this consensus key can never validate again"
+  [ "$jailed" = true ] || { ok "the validator $oper is not jailed"; return 0; }
+  key_exists || die "the key \"$KEY_NAME\" is not in the keyring of $NODE_HOME: unjail from the machine that holds the validator account"
+  info "validator $oper is jailed"
+  warn "unjail only once the node is in sync and signing: a validator jailed again for downtime waits longer"
+  if broadcast tx slashing unjail --from "$KEY_NAME" --chain-id "$CHAIN_ID" --keyring-backend "$KEYRING" --home "$NODE_HOME" \
+      --gas auto --gas-adjustment 1.3 --gas-prices "$TX_GAS_PRICE" --node "$(local_rpc)"; then
+    ok "unjailed: the validator is back in the active set at the next block"
+  fi
 }
 
 cmd_uninstall() {
@@ -1972,7 +2275,7 @@ usage: huahua-node [command]
 
   (none)      the interactive interface on a terminal, the setup otherwise
   install     the step by step setup (HUAHUA_PLAIN=1: no full screen interface)
-  status      height, sync, peers, version, scheduled upgrade
+  status      height, sync, peers, version, scheduled upgrade, validator state
   watch       live sync progress
   logs        follow the node logs
   upgrade     prepare the binary of the scheduled chain upgrade (or of one in voting)
@@ -1980,7 +2283,9 @@ usage: huahua-node [command]
               hourly check that prepares the scheduled upgrade by itself
   update      update the Huahua Node Manager itself to the latest release
   validator   create the validator (key, funds, create-validator)
+  unjail      unjail the validator, once the cause of the jailing is fixed
   uninstall   remove the node (keys are backed up first)
+  version     print the version
 
 Unattended setup: answer with environment variables, HUAHUA_YES=1 accepts
 the defaults of the rest. Variables: SETUP_MODE (easy|advanced), NODE_ROLE
@@ -2003,8 +2308,12 @@ main() {
     else what=install; fi
   fi
   case $what in
-    help|-h|--help|update) ;;
-    *) ensure_installed; update_check "$@" ;;
+    help|-h|--help|version|-v|--version|update) ;;
+    install) ensure_installed; update_check "$@" ;;
+    *)
+      # the other commands read the node through curl and jq: get them first
+      if ! have curl || ! have jq; then install_deps quiet; fi
+      ensure_installed; update_check "$@" ;;
   esac
   case $what in
     tui) cmd_tui ;;
@@ -2015,8 +2324,10 @@ main() {
     upgrade) shift; cmd_upgrade "$@" ;;
     auto-upgrade) shift; cmd_auto_upgrade "$@" ;;
     validator) cmd_validator ;;
+    unjail) cmd_unjail ;;
     uninstall) cmd_uninstall ;;
     update) cmd_update ;;
+    version|-v|--version) say "huahua-node $SCRIPT_VERSION" ;;
     help|-h|--help) cmd_help ;;
     *) cmd_help; exit 1 ;;
   esac
