@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.5 (2026-10-10)
+
+- The manager only looks at the nodes of the user running it. Another user's node, even when readable, is no longer picked up: run `huahua-node` as that user to manage it.
+- A node of this user in `~/.chihuahuad` is found even when it is not running: name and ports from `config.toml`, the systemd unit that runs that directory when there is one. Before, a stopped node not set up by the manager was not found at all.
+
 ## 0.3.4 (2026-10-10)
 
 - Fix: with nodes of several users on the machine, the dashboard could mix them up. The detection took the first `chihuahuad` process it found, even one of another user whose configuration it could not read; it then fell back to the default RPC port, which belonged to this user's node. The result showed this user's node name and state with the other user's directory and binary ("Permission denied" in place of the version, validator not detected). The detection now prefers this user's nodes, and skips another user's node when its configuration cannot be read.

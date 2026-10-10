@@ -137,12 +137,13 @@ The setup runs in eight steps:
 
 When a node is already on the machine, `huahua-node` shows it and offers the actions on it.
 
-It detects:
+It detects, for the user running it:
 
 - the nodes it installed, running or not;
-- any `chihuahua-1` node running as a systemd service, as a Docker container, or started by hand. Nodes of other networks are ignored.
+- any `chihuahua-1` node of this user running as a systemd service, as a Docker container, or started by hand;
+- a node of this user in `~/.chihuahuad` that is not running (name and ports from `config.toml`, and the systemd unit that runs that directory, if any).
 
-With several nodes on the machine, the nodes of the current user come first; a node of another user is managed only when its configuration can be read. Run `huahua-node` as the user of the node to manage.
+Nodes of other networks, and nodes of other users, are ignored: run `huahua-node` as the user of the node to manage.
 
 **Add cosmovisor** puts an existing node under cosmovisor:
 

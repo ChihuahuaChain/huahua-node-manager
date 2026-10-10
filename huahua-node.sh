@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION=0.3.4
+SCRIPT_VERSION=0.3.5
 CHAIN_ID=chihuahua-1
 DENOM=uhuahua
 DAEMON=chihuahuad
@@ -555,7 +555,7 @@ load_conf() {
     : "${SERVICE:=chihuahuad}" "${CONTAINER:=chihuahuad}" "${AUTO_DOWNLOAD:=no}"
     return
   fi
-  detect_running_node || die "no Chihuahua node found: run huahua-node without arguments to set one up"
+  detect_running_node || detect_stopped_node || die "no Chihuahua node found: run huahua-node without arguments to set one up"
 }
 
 service_ctl() {
@@ -583,15 +583,11 @@ service_ctl() {
   esac
 }
 
+# detect_running_node: a chihuahua-1 node running as this user (other users'
+# nodes are theirs to manage: run huahua-node as that user)
 detect_running_node() {
-  local pid args home user cg cid comm ppid st cfg p me mine=() others=()
-  me=$(id -un)
-  # the nodes of this user first: with several nodes on the machine, the one
-  # this user can manage is the one wanted
-  for pid in $({ pgrep -x cosmovisor; pgrep -x "$DAEMON"; } 2>/dev/null || true); do
-    if [ "$(ps -o user= -p "$pid" 2>/dev/null)" = "$me" ]; then mine+=("$pid"); else others+=("$pid"); fi
-  done
-  for pid in "${mine[@]}" "${others[@]}"; do
+  local pid args home user cg cid comm ppid st cfg p
+  for pid in $({ pgrep -x -u "$(id -u)" cosmovisor; pgrep -x -u "$(id -u)" "$DAEMON"; } 2>/dev/null || true); do
     args=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || continue
     [[ " $args " == *" start "* ]] || continue
     comm=$(ps -o comm= -p "$pid" 2>/dev/null)
@@ -619,9 +615,6 @@ detect_running_node() {
     NODE_BINARY=''
     if [ "$COSMOVISOR" = no ] && [ "$INSTALL_TYPE" != docker ]; then NODE_BINARY=$(readlink "/proc/$pid/exe" 2>/dev/null || true); fi
     cfg=$NODE_HOME/config/config.toml
-    # another user's node whose configuration cannot be read: its ports are
-    # unknown, and guessing them would mix it up with a node of this user
-    [ "$user" = "$me" ] || [ "$(id -u)" = 0 ] || [ -r "$cfg" ] || continue
     RPC_PORT=$(awk '/^\[rpc\]/ { s = 1 } s && /^laddr = / { gsub(/.*:|"/, ""); print; exit }' "$cfg" 2>/dev/null || true)
     P2P_PORT=$(awk '/^\[p2p\]/ { s = 1 } s && /^laddr = / { gsub(/.*:|"/, ""); print; exit }' "$cfg" 2>/dev/null || true)
     : "${RPC_PORT:=26657}" "${P2P_PORT:=26656}"
@@ -635,6 +628,30 @@ detect_running_node() {
   return 1
 }
 
+# detect_stopped_node: a node of this user in ~/.chihuahuad that is not
+# running: its name, ports and service from the files
+detect_stopped_node() {
+  local home=$HOME/.chihuahuad cfg unit
+  cfg=$home/config/config.toml
+  [ -r "$cfg" ] || return 1
+  # a node of another network is not ours; the chain id is at the top of the genesis
+  if [ -f "$home/config/genesis.json" ] && head -c 65536 "$home/config/genesis.json" | grep -q '"chain_id"' &&
+     ! head -c 65536 "$home/config/genesis.json" | grep -q "\"chain_id\": *\"$CHAIN_ID\""; then return 1; fi
+  NODE_HOME=$home
+  MONIKER=$(awk '/^moniker = / { gsub(/^moniker = "|"$/, ""); print; exit }' "$cfg")
+  RPC_PORT=$(awk '/^\[rpc\]/ { s = 1 } s && /^laddr = / { gsub(/.*:|"/, ""); print; exit }' "$cfg" 2>/dev/null || true)
+  P2P_PORT=$(awk '/^\[p2p\]/ { s = 1 } s && /^laddr = / { gsub(/.*:|"/, ""); print; exit }' "$cfg" 2>/dev/null || true)
+  : "${RPC_PORT:=26657}" "${P2P_PORT:=26656}" "${MONIKER:=?}"
+  COSMOVISOR=no; [ -d "$home/cosmovisor" ] && COSMOVISOR=yes
+  INSTALL_TYPE=manual SERVICE='' CONTAINER='' COMPOSE_DIR='' NODE_PID='' NODE_BINARY=''
+  unit=$(grep -lE -- "(--home[= ]|DAEMON_HOME=)$home( |$)" /etc/systemd/system/*.service 2>/dev/null | head -1 || true)
+  if [ -n "$unit" ]; then INSTALL_TYPE=native SERVICE=${unit##*/}; SERVICE=${SERVICE%.service}; fi
+  NODE_ROLE=full; [ -f "$home/config/priv_validator_key.json" ] && [ -s "$home/data/priv_validator_state.json" ] &&
+    [ "$(jq -r '.height // "0"' "$home/data/priv_validator_state.json" 2>/dev/null)" != 0 ] && NODE_ROLE=validator
+  NODE_USER=$(id -un) AUTO_DOWNLOAD=no KEYRING=file KEY_NAME=wallet MANAGED='' CONF_LOADED=1
+  return 0
+}
+
 find_node() {
   if [ -f "$CONF_FILE" ]; then
     load_conf
@@ -642,7 +659,7 @@ find_node() {
     warn "the node recorded in $CONF_FILE is gone ($NODE_HOME)"
     CONF_LOADED='' MANAGED=''
   fi
-  detect_running_node
+  detect_running_node || detect_stopped_node
 }
 
 node_panel() {
@@ -650,7 +667,7 @@ node_panel() {
   state=$(service_ctl status 2>/dev/null || true)
   case $INSTALL_TYPE in
     docker) how="Docker container $CONTAINER" ;;
-    manual) how="process $NODE_PID, started by hand" ;;
+    manual) how="process $NODE_PID, started by hand"; [ -n "${NODE_PID:-}" ] || how="no service found (start it by hand, or add cosmovisor)" ;;
     *) how="systemd service $SERVICE" ;;
   esac
   say
@@ -1869,7 +1886,7 @@ tui_header() {
   fi
   case $INSTALL_TYPE in
     docker) how="Docker container $CONTAINER" ;;
-    manual) how="process $NODE_PID, started by hand" ;;
+    manual) how="process $NODE_PID, started by hand"; [ -n "${NODE_PID:-}" ] || how="no service found" ;;
     *) how="systemd service $SERVICE" ;;
   esac
   H_LINES+=("${B}$MONIKER${R}  ${D}·${R}  $([ "$NODE_ROLE" = validator ] && echo validator || echo "full node")  ${D}·${R}  $how")
