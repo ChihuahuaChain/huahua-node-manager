@@ -268,6 +268,188 @@ validator_info() {
   printf '%s\t%s\n' "${sign:-$'0\tfalse'}" "$val"
 }
 
+# --- consensus: who has voted on the current block, and how much voting
+# power is still missing for the 2/3 that commit it. The data comes from
+# /consensus_state (CometBFT RPC): the "bit arrays" of the prevotes and the
+# precommits of the current round, one bit per validator of the set, in the
+# order /validators lists them. Useful at a chain upgrade, when the chain
+# waits for enough validators to come back on the new binary.
+
+# the consensus addresses and monikers of the bonded validators, cached on
+# disk while the node is up so that they are there when it is halted
+VALIDATORS_FILE=${CONF_FILE%.env}.validators
+refresh_validator_names() {
+  local tmp key moniker addr
+  tmp=$(mktemp)
+  while IFS=$'\t' read -r key moniker; do
+    [ -n "$key" ] || continue
+    # consensus address = first 20 bytes of sha256(ed25519 public key), hex
+    addr=$(printf '%s' "$key" | base64 -d 2>/dev/null | sha256sum | cut -c1-40 | tr a-f A-F)
+    # printable ASCII only: emoji and wide characters would break the layout
+    moniker=$(printf '%s' "$moniker" | tr -cd '\40-\176' | tr -s ' ' | sed 's/^ *//; s/ *$//')
+    printf '%s\t%s\n' "$addr" "${moniker:-?}" >> "$tmp"
+  done < <(nd_q staking validators --limit 1000 |
+    jq -r '.validators[]? | select(.status == "BOND_STATUS_BONDED") | "\(.consensus_pubkey.key)\t\(.description.moniker)"' 2>/dev/null || true)
+  if [ -s "$tmp" ]; then mv -f "$tmp" "$VALIDATORS_FILE"; else rm -f "$tmp"; fi
+}
+declare -A VNAME
+load_validator_names() {
+  local a m
+  VNAME=()
+  [ -f "$VALIDATORS_FILE" ] || return 0
+  while IFS=$'\t' read -r a m; do [ -n "$a" ] && VNAME[$a]=$m; done < "$VALIDATORS_FILE" || true
+}
+
+# bits_fraction "<bit array>": "<voted VP>\t<total VP>" from a string like
+# "BA{22:xx__x} 123/456 = 0.27"
+bits_fraction() {
+  local f; f=$(sed -nE 's/.*\} ([0-9]+)\/([0-9]+) = .*/\1\t\2/p' <<< "$1")
+  printf '%s\n' "${f:-$'0\t0'}"
+}
+
+# consensus_info: one "<key>\t<value>" per line: src, hrs (height/round/step),
+# start (of the round), prevotes and precommits ("<voted>\t<total>"), and one
+# nopv / nopc line ("<address>\t<voting power>") per validator that has not
+# voted yet. From this node when it answers, else from a public RPC.
+consensus_info() {
+  local rpc cs hrs h r pv pc vs page total bits i addrs=() vps=()
+  for rpc in "$(local_rpc)" ${STATESYNC_RPCS//,/ } $PEER_RPCS; do
+    rpc=${rpc%:443}
+    if cs=$(curl -fs --max-time 4 "$rpc/consensus_state" 2>/dev/null) && [ -n "$cs" ]; then break; fi
+    cs=''
+  done
+  [ -n "$cs" ] || return 1
+  hrs=$(jq -r '.result.round_state."height/round/step" // empty' <<< "$cs" 2>/dev/null)
+  [ -n "$hrs" ] || return 1
+  h=${hrs%%/*}; r=${hrs#*/}; r=${r%%/*}
+  printf 'src\t%s\n' "$([ "$rpc" = "$(local_rpc)" ] && echo "this node" || echo "${rpc#*://}")"
+  printf 'hrs\t%s\n' "$hrs"
+  printf 'start\t%s\n' "$(jq -r '.result.round_state.start_time // empty' <<< "$cs")"
+  pv=$(jq -r --argjson r "$r" '[.result.round_state.height_vote_set[]? | select(.round == $r)] | last | .prevotes_bit_array // empty' <<< "$cs")
+  pc=$(jq -r --argjson r "$r" '[.result.round_state.height_vote_set[]? | select(.round == $r)] | last | .precommits_bit_array // empty' <<< "$cs")
+  printf 'prevotes\t%s\n' "$(bits_fraction "$pv")"
+  printf 'precommits\t%s\n' "$(bits_fraction "$pc")"
+  page=1
+  while vs=$(curl -fs --max-time 4 "$rpc/validators?height=$h&page=$page&per_page=100" 2>/dev/null); do
+    while IFS=$'\t' read -r i total; do [ -n "$i" ] && { addrs+=("$i"); vps+=("$total"); }; done < <(
+      jq -r '.result.validators[]? | "\(.address)\t\(.voting_power)"' <<< "$vs" 2>/dev/null)
+    total=$(jq -r '.result.total // 0 | tonumber' <<< "$vs" 2>/dev/null || echo 0)
+    [ "${#addrs[@]}" -lt "$total" ] && [ "$page" -lt 20 ] || break
+    page=$((page + 1))
+  done
+  bits=${pv#*\{}; bits=${bits#*:}; bits=${bits%%\}*}
+  for ((i = 0; i < ${#bits}; i++)); do [ "${bits:i:1}" = _ ] && printf 'nopv\t%s\t%s\n' "${addrs[i]:-?}" "${vps[i]:-0}"; done
+  bits=${pc#*\{}; bits=${bits#*:}; bits=${bits%%\}*}
+  for ((i = 0; i < ${#bits}; i++)); do [ "${bits:i:1}" = _ ] && printf 'nopc\t%s\t%s\n' "${addrs[i]:-?}" "${vps[i]:-0}"; done
+  return 0
+}
+
+# parse_consensus "<consensus_info output>": into the CONS_* variables
+parse_consensus() {
+  local k v
+  CONS_SRC='' CONS_HRS='' CONS_START='' CONS_PV=$'0\t0' CONS_PC=$'0\t0' CONS_NOPV=() CONS_NOPC=()
+  while IFS=$'\t' read -r k v; do
+    case $k in
+      src) CONS_SRC=$v ;; hrs) CONS_HRS=$v ;; start) CONS_START=$v ;;
+      prevotes) CONS_PV=$v ;; precommits) CONS_PC=$v ;;
+      nopv) CONS_NOPV+=("$v") ;; nopc) CONS_NOPC+=("$v") ;;
+    esac
+  done <<< "$1"
+}
+
+# pct1 <part> <total>: percentage with one decimal
+pct1() { [ "${2:-0}" -gt 0 ] || { echo "0.0"; return; }; local p=$(( $1 * 1000 / $2 )); echo "$((p / 10)).$((p % 10))"; }
+
+# vote_bar <width> <voted> <total>: a bar of the voting power that has
+# voted, with the 2/3 mark
+vote_bar() {
+  local w=$1 f=0 mark out='' i c
+  [ "${3:-0}" -gt 0 ] && f=$(( w * $2 / $3 ))
+  mark=$(( (w * 2 + 2) / 3 ))
+  for ((i = 0; i < w; i++)); do
+    if [ "$i" = "$mark" ]; then c="${YEL}┃${R}"
+    elif [ "$i" -lt "$f" ]; then c="${GRN}█${R}"
+    else c="${D}░${R}"; fi
+    out+=$c
+  done
+  printf '%s' "$out"
+}
+
+# consensus_lines <width> <max lines>: the consensus view, into the array
+# CONS_LINES, from the CONS_* variables (see parse_consensus)
+consensus_lines() {
+  local w=$1 max=$2 pv_v pv_t pc_v pc_t need missing age h r s bw n i a vp label
+  CONS_LINES=()
+  if [ -z "$CONS_HRS" ]; then
+    CONS_LINES+=("" "  ${YEL}no consensus data: neither this node nor the public RPCs answer${R}")
+    return
+  fi
+  h=${CONS_HRS%%/*}; r=${CONS_HRS#*/}; s=${r#*/}; r=${r%%/*}
+  IFS=$'\t' read -r pv_v pv_t <<< "$CONS_PV"
+  IFS=$'\t' read -r pc_v pc_t <<< "$CONS_PC"
+  age=''
+  if [ -n "$CONS_START" ]; then
+    age=$(( $(date +%s) - $(date -d "$CONS_START" +%s 2>/dev/null || date +%s) ))
+    [ "$age" -ge 0 ] || age=0
+  fi
+  case $s in
+    1) label="new height" ;; 2) label=propose ;; 3) label=prevote ;; 4) label="prevote wait" ;;
+    5) label=precommit ;; 6) label="precommit wait" ;; 7) label=commit ;; *) label="step $s" ;;
+  esac
+  CONS_LINES+=("" "  ${D}block${R}       ${B}$h${R}   ${D}round${R} $r   ${D}step${R} $label${age:+   ${D}for $(fmt_duration "$age")${R}}")
+  if [ -n "${T_PLAN_HEIGHT:-}" ] && [ "$h" = "$T_PLAN_HEIGHT" ]; then
+    CONS_LINES+=("  ${YEL}upgrade height: the chain resumes when more than 2/3 of the voting power runs the new binary${R}")
+  fi
+  bw=$((w - 40)); [ "$bw" -gt 40 ] && bw=40; [ "$bw" -lt 10 ] && bw=10
+  CONS_LINES+=("" "  ${D}prevotes${R}    $(vote_bar "$bw" "$pv_v" "$pv_t") $(printf '%5s' "$(pct1 "$pv_v" "$pv_t")")%"
+    "  ${D}precommits${R}  $(vote_bar "$bw" "$pc_v" "$pc_t") $(printf '%5s' "$(pct1 "$pc_v" "$pc_t")")%  ${D}needed > 66.7%${R} ${YEL}┃${R}")
+  need=$(( pc_t * 2 / 3 + 1 ))
+  if [ "$pc_t" -gt 0 ] && [ "$pc_v" -lt "$need" ]; then
+    missing=$((need - pc_v))
+    CONS_LINES+=("  ${D}missing${R}     $(pct1 "$missing" "$pc_t")% of the voting power still has to precommit  ${D}(${#CONS_NOPC[@]} validators have not)${R}")
+  elif [ "$pc_t" -gt 0 ]; then
+    CONS_LINES+=("  ${GRN}enough voting power: the block is being committed${R}")
+  fi
+  CONS_LINES+=("  ${D}source      $CONS_SRC${R}")
+  if [ ${#CONS_NOPC[@]} -gt 0 ]; then
+    CONS_LINES+=("" "  ${D}not voted yet, by voting power:${R}")
+    n=$((max - ${#CONS_LINES[@]} - 1)); [ "$n" -lt 1 ] && n=1
+    for ((i = 0; i < ${#CONS_NOPC[@]} && i < n; i++)); do
+      a=${CONS_NOPC[i]}; vp=${a#*$'\t'}; a=${a%%$'\t'*}
+      CONS_LINES+=("  $(printf '%5s' "$(pct1 "$vp" "$pc_t")")%  ${VNAME[$a]:-${a:0:12}…}$([ -n "${VNAME[$a]:-}" ] && printf ' %s' "${D}${a:0:8}${R}")")
+    done
+    if [ "$i" -lt ${#CONS_NOPC[@]} ]; then CONS_LINES+=("  ${D}and $(( ${#CONS_NOPC[@]} - i )) more${R}"); fi
+  fi
+}
+
+# cmd_consensus: the consensus view on the terminal, refreshed every 2
+# seconds (once when there is no terminal)
+cmd_consensus() {
+  load_conf
+  local out stop='' name height
+  IFS=$'\t' read -r name height <<< "$(upgrade_plan)"
+  [ -n "${height:-}" ] && T_PLAN_HEIGHT=$height
+  load_validator_names
+  [ ${#VNAME[@]} -gt 0 ] || refresh_validator_names 2>/dev/null; load_validator_names
+  trap 'stop=1' INT
+  while :; do
+    out=$(consensus_info 2>/dev/null || true)
+    parse_consensus "$out"
+    consensus_lines "$(tput cols 2>/dev/null || echo 80)" 40
+    if [ -t 1 ]; then
+      printf '\e[H\e[2J%s\n' "${B}${YEL}huahua-node${R} ${D}·${R} consensus${name:+  ${D}· upgrade $name at height $height${R}}"
+      printf '%s\n' "${CONS_LINES[@]}"
+      printf '\n  %s\n' "${D}refreshed every 2s · Ctrl-C to quit${R}"
+    else
+      printf '%s\n' "${CONS_LINES[@]}"; break
+    fi
+    sleep 2 || true
+    [ -n "$stop" ] && break
+  done
+  trap - INT
+  return 0
+}
+
 live_peers() {
   local rpc
   for rpc in $PEER_RPCS; do
@@ -1550,8 +1732,13 @@ tui_refresh() {
       tui_bg voting voting_upgrades
       if [ "${T_VP:-0}" != 0 ] || [ "$NODE_ROLE" = validator ]; then tui_bg val validator_info; else T_BG[val]=''; fi
     else
-      T_BG[plan]='' T_BG[voting]='' T_BG[val]=''
+      # halted at an upgrade height, cosmovisor leaves the plan in upgrade-info.json
+      T_BG[plan]=$(jq -r 'select(.name and .height) | "\(.name)\t\(.height)"' "$NODE_HOME/data/upgrade-info.json" 2>/dev/null || true)
+      [ "${T_BG[plan]#*$'\t'}" -ge "${T_H:-0}" ] 2>/dev/null || T_BG[plan]=''
+      T_BG[voting]='' T_BG[val]=''
     fi
+    # the validator names for the consensus view, refreshed twice an hour
+    if [ -n "$T_UP" ] && [ $((now - ${T_NAMES_AT:-0})) -ge 1800 ]; then T_NAMES_AT=$now; tui_bg names refresh_validator_names; fi
     T_AUTO=$(auto_upgrade_state)
     T_AUTO_TIMES=''
     [ "$T_AUTO" = on ] && T_AUTO_TIMES=$(auto_upgrade_times)
@@ -1561,6 +1748,12 @@ tui_refresh() {
   T_PLAN=''; [ -n "${T_BG[plan]:-}" ] && T_PLAN="$T_PLAN_NAME at height $T_PLAN_HEIGHT"
   T_VOTING=${T_BG[voting]:-}
   IFS=$'\t' read -r T_V_MISSED T_V_TOMB T_V_JAILED T_V_STATUS T_V_OPER <<< "${T_BG[val]:-}"
+  if [ "$T_TAB" = 3 ] && [ -n "${T_CONS:-}" ]; then
+    if [ $((now - ${T_CONS_AT:-0})) -ge 2 ]; then T_CONS_AT=$now; tui_bg cons consensus_info; fi
+    if [ "$(stat -c %Y "$VALIDATORS_FILE" 2>/dev/null || echo 0)" != "${T_NAMES_MTIME:-}" ]; then
+      T_NAMES_MTIME=$(stat -c %Y "$VALIDATORS_FILE" 2>/dev/null || echo 0); load_validator_names
+    fi
+  fi
   if [ "$T_TAB" = 2 ] && [ $((now - ${T_LOG_AT:-0})) -ge 2 ]; then T_LOG_AT=$now; T_LOG=$(node_log_tail | tail -n 200); fi
   if [ "$T_TAB" = 1 ] && [ "${T_H:-0}" = 0 ] && [ -n "$T_UP" ] && [ $((now - ${T_PHASE_AT:-0})) -ge 2 ]; then
     T_PHASE_AT=$now; T_PHASE=$(statesync_phase)
@@ -1626,18 +1819,22 @@ tui_actions() {
     1) if [ "$SYNC" = statesync ] || [ -z "${T_UP:-}" ] || [ "${T_CATCH:-}" != false ]; then
          ACTS+=("snapshot:Restart from the latest snapshot (deletes the chain data)")
        fi ;;
-    3) if [ -z "${T_PLAN:-}" ] && [ -n "${T_VOTING:-}" ]; then
-         ACTS+=("upgrade:Prepare $(head -1 <<< "$T_VOTING" | cut -f2) in advance (proposal #$(head -1 <<< "$T_VOTING" | cut -f1) in voting)")
+    3) if [ -n "${T_CONS:-}" ]; then ACTS=("consback:Back to the upgrade view")
        else
-         ACTS+=("upgrade:Prepare the scheduled upgrade")
-       fi
-       if [ "$COSMOVISOR" = yes ]; then
-         case ${T_AUTO:-off} in
-           on) ACTS+=("autooff:Turn automatic upgrades off") ;;
-           off) ACTS+=("autoon:Turn automatic upgrades on (hourly check)") ;;
-         esac
-       fi
-       [ "$COSMOVISOR" = yes ] || ACTS+=("cosmovisor:Add cosmovisor") ;;
+         ACTS+=("consensus:Consensus: votes and voting power on the current block (live)")
+         if [ -z "${T_PLAN:-}" ] && [ -n "${T_VOTING:-}" ]; then
+           ACTS+=("upgrade:Prepare $(head -1 <<< "$T_VOTING" | cut -f2) in advance (proposal #$(head -1 <<< "$T_VOTING" | cut -f1) in voting)")
+         else
+           ACTS+=("upgrade:Prepare the scheduled upgrade")
+         fi
+         if [ "$COSMOVISOR" = yes ]; then
+           case ${T_AUTO:-off} in
+             on) ACTS+=("autooff:Turn automatic upgrades off") ;;
+             off) ACTS+=("autoon:Turn automatic upgrades on (hourly check)") ;;
+           esac
+         fi
+         [ "$COSMOVISOR" = yes ] || ACTS+=("cosmovisor:Add cosmovisor")
+       fi ;;
     4) if [ -n "${T_V_OPER:-}" ]; then [ "${T_V_JAILED:-}" = true ] && ACTS+=("unjail:Unjail the validator")
        elif [ -n "${T_UP:-}" ] && [ "${T_VP:-0}" = 0 ]; then ACTS+=("validator:Create the validator (guided)"); fi ;;
     5) ACTS+=("setup:Set up another node")
@@ -1708,6 +1905,12 @@ tui_body() {
         done < <(tail -n "$h" <<< "$T_LOG")
       fi ;;
     3)
+      if [ -n "${T_CONS:-}" ]; then
+        parse_consensus "${T_BG[cons]:-}"
+        consensus_lines "$w" "$h"
+        BODY+=("${CONS_LINES[@]}")
+        return
+      fi
       local prepared sched
       prepared=$(ls -1 "$NODE_HOME/cosmovisor/upgrades" 2>/dev/null | paste -sd' ' - || true)
       if [ -z "${T_PLAN:-}" ]; then sched=none
@@ -1840,6 +2043,9 @@ tui_do() {
     status) tui_run cmd_status ;;
     snapshot) tui_run confirm_snapshot ;;
     upgrade) tui_run cmd_upgrade ;;
+    consensus) T_CONS=1 T_CONS_AT=0 T_SEL=0; load_validator_names
+      [ ${#VNAME[@]} -gt 0 ] || tui_bg names refresh_validator_names ;;
+    consback) T_CONS='' T_SEL=0 ;;
     autoon) tui_run auto_upgrade_on; T_SLOW_AT=0 ;;
     autooff) tui_run auto_upgrade_off; T_SLOW_AT=0 ;;
     validator) tui_run cmd_validator ;;
@@ -1870,9 +2076,9 @@ cmd_tui() {
     read_key 1
     [ -n "$KEY" ] && T_MSG=''
     case $KEY in
-      right|tab|l) T_TAB=$(( (T_TAB + 1) % ${#TUI_TABS[@]} )); T_SEL=0 ;;
-      left|btab|h) T_TAB=$(( (T_TAB + ${#TUI_TABS[@]} - 1) % ${#TUI_TABS[@]} )); T_SEL=0 ;;
-      [1-6]) T_TAB=$((KEY - 1)); T_SEL=0 ;;
+      right|tab|l) T_TAB=$(( (T_TAB + 1) % ${#TUI_TABS[@]} )); T_SEL=0 T_CONS='' ;;
+      left|btab|h) T_TAB=$(( (T_TAB + ${#TUI_TABS[@]} - 1) % ${#TUI_TABS[@]} )); T_SEL=0 T_CONS='' ;;
+      [1-6]) T_TAB=$((KEY - 1)); T_SEL=0 T_CONS='' ;;
       up|k) [ "$T_SEL" -gt 0 ] && T_SEL=$((T_SEL - 1)) ;;
       down|j) T_SEL=$((T_SEL + 1)); tui_actions; [ "$T_SEL" -lt "${#ACTS[@]}" ] || T_SEL=$((${#ACTS[@]} > 0 ? ${#ACTS[@]} - 1 : 0)) ;;
       enter) tui_actions; [ ${#ACTS[@]} -gt 0 ] && { ACT_LABEL=${ACTS[T_SEL]#*:}; tui_do "${ACTS[T_SEL]%%:*}"; } ;;
@@ -2277,6 +2483,7 @@ usage: huahua-node [command]
   install     the step by step setup (HUAHUA_PLAIN=1: no full screen interface)
   status      height, sync, peers, version, scheduled upgrade, validator state
   watch       live sync progress
+  consensus   live votes and voting power on the current block (who is missing at an upgrade)
   logs        follow the node logs
   upgrade     prepare the binary of the scheduled chain upgrade (or of one in voting)
   auto-upgrade [on|off|status]
@@ -2320,6 +2527,7 @@ main() {
     install) cmd_install ;;
     status) cmd_status ;;
     watch) cmd_watch ;;
+    consensus) cmd_consensus ;;
     logs) cmd_logs ;;
     upgrade) shift; cmd_upgrade "$@" ;;
     auto-upgrade) shift; cmd_auto_upgrade "$@" ;;

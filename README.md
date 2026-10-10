@@ -67,7 +67,7 @@ On a terminal, `huahua-node` opens a full screen dashboard. The logo and the nod
 | **1 Node** | name, type, directory, version, cosmovisor, ports, disk | start, stop, restart, add cosmovisor, full status |
 | **2 Sync** | block, network height, blocks behind, speed, progress bar, time left, state sync phase | restart from the snapshot (state sync nodes) |
 | **3 Logs** | the live node log, errors in red and warnings in yellow | |
-| **4 Upgrade** | running version, scheduled upgrade with whether its binary is prepared and the blocks left, upgrade proposals in voting, binaries prepared for cosmovisor, automatic upgrades on/off with the last and next check | prepare the scheduled upgrade (or the one in voting), turn automatic upgrades on or off |
+| **4 Upgrade** | running version, scheduled upgrade with whether its binary is prepared and the blocks left, upgrade proposals in voting, binaries prepared for cosmovisor, automatic upgrades on/off with the last and next check | live consensus view (votes and voting power on the current block), prepare the scheduled upgrade (or the one in voting), turn automatic upgrades on or off |
 | **5 Validator** | operator address, state (active, not in the active set, jailed, tombstoned), voting power, missed blocks | create the validator, unjail it |
 | **6 Setup** | | set up another node, uninstall |
 
@@ -157,6 +157,7 @@ It detects:
 | `huahua-node install` | the step by step setup |
 | `huahua-node status` | height, sync, peers, version, disk, scheduled upgrade, upgrade proposals in voting, automatic upgrades |
 | `huahua-node watch` | live sync progress |
+| `huahua-node consensus` | live votes and voting power on the current block: who is still missing for the 2/3 |
 | `huahua-node logs` | follow the node log |
 | `huahua-node upgrade [tag [name]]` | fetch the binary of the scheduled upgrade (or of the one in voting) into cosmovisor |
 | `huahua-node auto-upgrade [on\|off\|status]` | turn the automatic upgrades on or off, or show their state |
@@ -277,6 +278,16 @@ At the upgrade height the node stops, cosmovisor switches the binary and the nod
 huahua-node upgrade                    # the scheduled upgrade, or the one in voting
 huahua-node upgrade v10.0.0 v10.0.0    # a given release for a given upgrade name
 ```
+
+### Watching the upgrade
+
+At the upgrade height the chain stops until **more than 2/3 of the voting power** (66.7%) runs the new binary and precommits the next block. The **Consensus** view, from the Upgrade tab or with `huahua-node consensus`, follows it live:
+
+- block, round and step of the consensus, and for how long;
+- the voting power that has prevoted and precommitted, as bars with the 2/3 mark, and what is still missing;
+- the validators that have not voted yet, by voting power, with their names.
+
+It reads `/consensus_state` from this node and, while the node is restarting on the new binary, from the public RPCs. Validator names are cached in `~/.huahua-node.validators` while the node is up, so they are there during the halt. The same view shows why a chain is halted at any other time.
 
 ## Becoming a validator
 

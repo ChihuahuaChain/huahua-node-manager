@@ -27,6 +27,8 @@
 
 ### Upgrades
 
+- New: a live **Consensus** view, from the Upgrade tab and with `huahua-node consensus`. It shows the block, round and step of the consensus, the voting power that has prevoted and precommitted with the 2/3 mark, what is still missing, and the validators that have not voted yet, by voting power, with their names. At an upgrade height it tells how far the chain is from resuming; the data comes from this node, or from the public RPCs while the node restarts on the new binary. Validator names are cached in `~/.huahua-node.validators` while the node is up.
+- When the node is halted at an upgrade height, the dashboard reads the upgrade from cosmovisor's `upgrade-info.json` and keeps showing it.
 - The header, the Upgrade tab and `huahua-node status` say whether the scheduled upgrade's binary is prepared, and how many blocks are left (with an estimated time when the block interval is known).
 - The text menu can turn the automatic upgrades on and off.
 
