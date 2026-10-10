@@ -142,6 +142,8 @@ It detects:
 - the nodes it installed, running or not;
 - any `chihuahua-1` node running as a systemd service, as a Docker container, or started by hand. Nodes of other networks are ignored.
 
+With several nodes on the machine, the nodes of the current user come first; a node of another user is managed only when its configuration can be read. Run `huahua-node` as the user of the node to manage.
+
 **Add cosmovisor** puts an existing node under cosmovisor:
 
 - it keeps the start flags of the current command;
@@ -229,6 +231,7 @@ Behaviour variables:
 | `STALL_SECS` | seconds without progress before asking, default `300` |
 | `HUAHUA_PLAIN=1` | no full screen dashboard |
 | `HUAHUA_SNAPSHOT_URL` | another snapshot server |
+| `HUAHUA_REST_APIS` | the public REST APIs used for the chain queries when the node binary cannot be run by this user and the node's own API is off |
 
 ## Upgrades
 

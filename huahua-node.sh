@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION=0.3.3
+SCRIPT_VERSION=0.3.4
 CHAIN_ID=chihuahua-1
 DENOM=uhuahua
 DAEMON=chihuahuad
@@ -12,6 +12,9 @@ GENESIS_SHA256=200a64f201c6b5799d81bcf52a25ce4eb1c0eac3f7c8c5eaa8335e75c5763f91
 REGISTRY_URL=https://raw.githubusercontent.com/cosmos/chain-registry/master/chihuahua/chain.json
 PEER_RPCS=${HUAHUA_PEER_RPCS:-https://rpc.chihuahua.wtf https://chihuahua-rpc.kleomedes.network https://rpc.chihuahua.validatus.com}
 STATESYNC_RPCS=${HUAHUA_STATESYNC_RPCS:-https://rpc.chihuahua.wtf:443,https://chihuahua-rpc.kleomedes.network:443}
+# public REST APIs: used for the chain queries when the node binary cannot be run
+# by this user (a node of another user, a Docker image) and the node's own API is off
+REST_APIS=${HUAHUA_REST_APIS:-https://api.chihuahua.wtf https://chihuahua-api.polkachu.com https://chihuahua-api.kleomedes.network}
 COSMOVISOR_VERSION=v1.7.1
 SELF_REPO=ChihuahuaChain/huahua-node-manager
 # where the releases of this script are checked and downloaded (overridable for tests)
@@ -226,22 +229,62 @@ node_bin() {
 nd() { "$(node_bin)" "$@"; }
 # bin_version <binary>: the version a chihuahuad binary reports (first line,
 # whichever stream it is printed on); fails when the binary does not run
-bin_version() { local v rc=0; v=$("$1" version 2>&1) || rc=$?; printf '%s\n' "${v%%$'\n'*}"; return $rc; }
+bin_version() {
+  local v rc=0
+  [ -x "$1" ] || return 1
+  v=$("$1" version 2>&1) || rc=$?
+  printf '%s\n' "${v%%$'\n'*}"; return $rc
+}
+# bin_ok: this user can run the node binary (not the case for a node of
+# another user, or of a Docker image)
+bin_ok() { [ -x "$(node_bin)" ]; }
+# node_version: from the binary, or from the running node (/abci_info)
+node_version() {
+  local v
+  if bin_ok && v=$(bin_version "$(node_bin)" 2>/dev/null); then echo "$v"; return; fi
+  v=$(curl -fs --max-time 3 "$(local_rpc)/abci_info" 2>/dev/null | jq -r '.result.response.version // empty' 2>/dev/null || true)
+  echo "${v#v}"
+}
 local_rpc() { echo "http://127.0.0.1:${RPC_PORT:-26657}"; }
 node_flag() { echo "--node=tcp://127.0.0.1:${RPC_PORT:-26657}"; }
 rpc_status() { curl -fs --max-time 5 "$(local_rpc)/status"; }
-# nd_q <query...>: a chain query on this node, as JSON. The node directory is
-# given explicitly so the CLI never creates a stray ~/.chihuahuad.
+# local_rest: the node's own REST API, when app.toml has it on
+local_rest() {
+  local app=$NODE_HOME/config/app.toml addr
+  awk '/^\[api\]/ { s = 1; next } /^\[/ { s = 0 } s && /^enable = true/ { found = 1 } END { exit !found }' "$app" 2>/dev/null || return 1
+  addr=$(awk '/^\[api\]/ { s = 1; next } /^\[/ { s = 0 } s && /^address = / { gsub(/.*:\/\/|"/, ""); print; exit }' "$app" 2>/dev/null)
+  [ -n "$addr" ] || return 1
+  echo "http://${addr/0.0.0.0/127.0.0.1}"
+}
+# chain_get <path>: a REST query, from the node's API when it is on, else
+# from the first public REST API that answers
+chain_get() {
+  local api out
+  for api in $(local_rest 2>/dev/null || true) $REST_APIS; do
+    if out=$(curl -fs --max-time 6 -H 'Accept: application/json' "$api$1" 2>/dev/null) && [ -n "$out" ]; then printf '%s' "$out"; return 0; fi
+  done
+  return 1
+}
+# nd_q <query...>: a chain query through the node binary, as JSON. The node
+# directory is given explicitly so the CLI never creates a stray ~/.chihuahuad.
 nd_q() { nd q "$@" -o json --home "$NODE_HOME" "$(node_flag)" 2>/dev/null; }
+# chain_q <REST path> <CLI query...>: the same query through the binary when
+# this user can run it (the node answers), through REST otherwise. The two
+# give the same JSON for the queries used here.
+chain_q() {
+  local path=$1; shift
+  if bin_ok; then nd_q "$@"; else chain_get "$path"; fi
+}
 # upgrade_plan: "<name>\t<height>" of the upgrade scheduled on chain, or nothing
 upgrade_plan() {
-  nd_q upgrade plan | jq -r '(.plan // .) | select(.name) | "\(.name)\t\(.height)"' 2>/dev/null || true
+  chain_q /cosmos/upgrade/v1beta1/current_plan upgrade plan |
+    jq -r '(.plan // .) | select(.name) | "\(.name)\t\(.height)"' 2>/dev/null || true
 }
 # voting_upgrades: one "<proposal id>\t<name>\t<height>\t<end of vote>" per
 # software upgrade proposal still in voting (MsgSoftwareUpgrade, or a legacy
 # SoftwareUpgradeProposal wrapped in MsgExecLegacyContent)
 voting_upgrades() {
-  nd_q gov proposals --proposal-status voting-period | jq -r '
+  chain_q '/cosmos/gov/v1/proposals?proposal_status=2&pagination.limit=100' gov proposals --proposal-status voting-period | jq -r '
     .proposals[]? | .id as $id | (.voting_end_time // "") as $end | .messages[]?
     | [., .value?, .content?, .value?.content?] | map(select(type == "object")) | .[]
     | select(((.type // .["@type"]) // "") | test("(MsgSoftwareUpgrade|SoftwareUpgradeProposal)$"))
@@ -249,10 +292,47 @@ voting_upgrades() {
     | "\($id)\t\(.name)\t\(.height)\t\($end[:16] | sub("T"; " "))"' 2>/dev/null || true
 }
 # upgrade_prepared <name>: the binary of that upgrade is in place for cosmovisor
-upgrade_prepared() { [ -x "$NODE_HOME/cosmovisor/upgrades/$1/bin/$DAEMON" ]; }
+upgrade_prepared() { [ -e "$NODE_HOME/cosmovisor/upgrades/$1/bin/$DAEMON" ]; }
+# validator_pubkey: the consensus public key of this node, as the JSON the
+# CLI takes; from the running node, or from the binary and the key file
 validator_pubkey() {
+  local k
+  k=$(rpc_status 2>/dev/null | jq -c 'select(.result.validator_info.pub_key.value) |
+    {"@type": "/cosmos.crypto.ed25519.PubKey", key: .result.validator_info.pub_key.value}' 2>/dev/null || true)
+  [ -n "$k" ] && { echo "$k"; return 0; }
+  bin_ok || return 1
   nd comet show-validator --home "$NODE_HOME" 2>/dev/null || nd tendermint show-validator --home "$NODE_HOME" 2>/dev/null
 }
+# cons_address_of <base64 ed25519 key>: the hex consensus address, the first
+# 20 bytes of the sha256 of the key
+cons_address_of() { printf '%s' "$1" | base64 -d 2>/dev/null | sha256sum | cut -c1-40 | tr a-f A-F; }
+
+# bech32_encode <hrp> <hex>: the bech32 form of a hex address (BIP 173),
+# e.g. the chihuahuavalcons1... address of a consensus key
+bech32_encode() {
+  local hrp=$1 hex=$2 charset=qpzry9x8gf2tvdw0s3jn54khce6mua7l
+  local -a data=() values=() gen=(0x3b6a57b2 0x26508e6d 0x1ea119fa 0x3d4233dd 0x2a1462b3)
+  local i acc=0 bits=0 chk=1 top v out
+  for ((i = 0; i < ${#hex}; i += 2)); do
+    acc=$(( ((acc << 8) | 16#${hex:i:2}) & 0xffff )); bits=$((bits + 8))
+    while [ "$bits" -ge 5 ]; do bits=$((bits - 5)); data+=( $(( (acc >> bits) & 31 )) ); done
+  done
+  [ "$bits" -gt 0 ] && data+=( $(( (acc << (5 - bits)) & 31 )) )
+  for ((i = 0; i < ${#hrp}; i++)); do values+=( $(( $(printf '%d' "'${hrp:i:1}") >> 5 )) ); done
+  values+=(0)
+  for ((i = 0; i < ${#hrp}; i++)); do values+=( $(( $(printf '%d' "'${hrp:i:1}") & 31 )) ); done
+  values+=("${data[@]}" 0 0 0 0 0 0)
+  for v in "${values[@]}"; do
+    top=$((chk >> 25)); chk=$(( ((chk & 0x1ffffff) << 5) ^ v ))
+    for i in 0 1 2 3 4; do [ $(( (top >> i) & 1 )) = 1 ] && chk=$((chk ^ gen[i])); done
+  done
+  chk=$((chk ^ 1))
+  out="${hrp}1"
+  for v in "${data[@]}"; do out+=${charset:v:1}; done
+  for ((i = 0; i < 6; i++)); do out+=${charset:$(( (chk >> (5 * (5 - i))) & 31 )):1}; done
+  echo "$out"
+}
+
 # validator_info: "<missed blocks>\t<tombstoned>\t<jailed>\t<status>\t<operator>"
 # for the validator signing with this node's consensus key; empty when the
 # key belongs to no validator
@@ -260,10 +340,11 @@ validator_info() {
   local pk key sign val
   pk=$(validator_pubkey) || return 0
   key=$(jq -r '.key // empty' <<< "$pk" 2>/dev/null); [ -n "$key" ] || return 0
-  val=$(nd_q staking validators --limit 1000 | jq -r --arg k "$key" '
+  val=$(chain_q '/cosmos/staking/v1beta1/validators?pagination.limit=1000' staking validators --limit 1000 | jq -r --arg k "$key" '
     .validators[]? | select(.consensus_pubkey.key == $k) | "\(.jailed)\t\(.status)\t\(.operator_address)"' 2>/dev/null || true)
   [ -n "$val" ] || return 0
-  sign=$(nd_q slashing signing-info "$pk" | jq -r '(.val_signing_info // .) |
+  sign=$(chain_q "/cosmos/slashing/v1beta1/signing_infos/$(bech32_encode chihuahuavalcons "$(cons_address_of "$key" | tr A-F a-f)")" \
+      slashing signing-info "$pk" | jq -r '(.val_signing_info // .) |
     "\(.missed_blocks_counter // 0)\t\(.tombstoned // false)"' 2>/dev/null || true)
   printf '%s\t%s\n' "${sign:-$'0\tfalse'}" "$val"
 }
@@ -283,12 +364,11 @@ refresh_validator_names() {
   tmp=$(mktemp)
   while IFS=$'\t' read -r key moniker; do
     [ -n "$key" ] || continue
-    # consensus address = first 20 bytes of sha256(ed25519 public key), hex
-    addr=$(printf '%s' "$key" | base64 -d 2>/dev/null | sha256sum | cut -c1-40 | tr a-f A-F)
+    addr=$(cons_address_of "$key")
     # printable ASCII only: emoji and wide characters would break the layout
     moniker=$(printf '%s' "$moniker" | tr -cd '\40-\176' | tr -s ' ' | sed 's/^ *//; s/ *$//')
     printf '%s\t%s\n' "$addr" "${moniker:-?}" >> "$tmp"
-  done < <(nd_q staking validators --limit 1000 |
+  done < <(chain_q '/cosmos/staking/v1beta1/validators?status=BOND_STATUS_BONDED&pagination.limit=1000' staking validators --limit 1000 |
     jq -r '.validators[]? | select(.status == "BOND_STATUS_BONDED") | "\(.consensus_pubkey.key)\t\(.description.moniker)"' 2>/dev/null || true)
   if [ -s "$tmp" ]; then mv -f "$tmp" "$VALIDATORS_FILE"; else rm -f "$tmp"; fi
 }
@@ -416,7 +496,7 @@ consensus_lines() {
     n=$((max - ${#CONS_LINES[@]} - 1)); [ "$n" -lt 1 ] && n=1
     for ((i = 0; i < ${#CONS_NOPC[@]} && i < n; i++)); do
       a=${CONS_NOPC[i]}; vp=${a#*$'\t'}; a=${a%%$'\t'*}
-      CONS_LINES+=("  $(printf '%5s' "$(pct1 "$vp" "$pc_t")")%  ${VNAME[$a]:-${a:0:12}…}$([ -n "${VNAME[$a]:-}" ] && printf ' %s' "${D}${a:0:8}${R}")")
+      CONS_LINES+=("  $(printf '%5s' "$(pct1 "$vp" "$pc_t")")%  ${VNAME[$a]:-${D}${a:0:12}…${R}}")
     done
     if [ "$i" -lt ${#CONS_NOPC[@]} ]; then CONS_LINES+=("  ${D}and $(( ${#CONS_NOPC[@]} - i )) more${R}"); fi
   fi
@@ -504,8 +584,14 @@ service_ctl() {
 }
 
 detect_running_node() {
-  local pid args home user cg cid comm ppid st cfg p
+  local pid args home user cg cid comm ppid st cfg p me mine=() others=()
+  me=$(id -un)
+  # the nodes of this user first: with several nodes on the machine, the one
+  # this user can manage is the one wanted
   for pid in $({ pgrep -x cosmovisor; pgrep -x "$DAEMON"; } 2>/dev/null || true); do
+    if [ "$(ps -o user= -p "$pid" 2>/dev/null)" = "$me" ]; then mine+=("$pid"); else others+=("$pid"); fi
+  done
+  for pid in "${mine[@]}" "${others[@]}"; do
     args=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || continue
     [[ " $args " == *" start "* ]] || continue
     comm=$(ps -o comm= -p "$pid" 2>/dev/null)
@@ -533,6 +619,9 @@ detect_running_node() {
     NODE_BINARY=''
     if [ "$COSMOVISOR" = no ] && [ "$INSTALL_TYPE" != docker ]; then NODE_BINARY=$(readlink "/proc/$pid/exe" 2>/dev/null || true); fi
     cfg=$NODE_HOME/config/config.toml
+    # another user's node whose configuration cannot be read: its ports are
+    # unknown, and guessing them would mix it up with a node of this user
+    [ "$user" = "$me" ] || [ "$(id -u)" = 0 ] || [ -r "$cfg" ] || continue
     RPC_PORT=$(awk '/^\[rpc\]/ { s = 1 } s && /^laddr = / { gsub(/.*:|"/, ""); print; exit }' "$cfg" 2>/dev/null || true)
     P2P_PORT=$(awk '/^\[p2p\]/ { s = 1 } s && /^laddr = / { gsub(/.*:|"/, ""); print; exit }' "$cfg" 2>/dev/null || true)
     : "${RPC_PORT:=26657}" "${P2P_PORT:=26656}"
@@ -1726,7 +1815,7 @@ tui_refresh() {
   if [ $((now - ${T_SLOW_AT:-0})) -ge 30 ]; then
     T_SLOW_AT=$now
     tui_bg disk tui_disk
-    T_VER=$(bin_version "$(node_bin)" 2>/dev/null || true)
+    T_VER=$(node_version)
     if [ -n "$T_UP" ]; then
       tui_bg plan upgrade_plan
       tui_bg voting voting_upgrades
@@ -2101,7 +2190,7 @@ cmd_status() {
       "  peers        \($peers)",
       "  voting power \($r.validator_info.voting_power)"' <<< "$st"
   fi
-  say "  version      $(bin_version "$(node_bin)" 2>/dev/null || echo "not readable by $(id -un)")"
+  say "  version      $(node_version)"
   say "  disk         $(du -sh "$NODE_HOME/data" 2>/dev/null | cut -f1)"
   [ -n "$up" ] || die "the node RPC does not answer on $(local_rpc): is the node running? (huahua-node logs)"
   local id name height end
@@ -2320,7 +2409,7 @@ wait_tx() {
   local i code
   for i in $(seq 1 12); do
     sleep 5
-    code=$(nd_q tx "$1" | jq -r '.code // empty' 2>/dev/null || true)
+    code=$(chain_q "/cosmos/tx/v1beta1/txs/$1" tx "$1" | jq -r '(.tx_response // .) | .code // empty' 2>/dev/null || true)
     [ -n "$code" ] && { echo "$code"; return 0; }
   done
   echo ""
@@ -2378,7 +2467,7 @@ cmd_validator() {
   [ -z "${MANAGED:-}" ] || save_conf
   local min=$(( (VALIDATOR_FEE_RESERVE + 1) * 1000000 ))
   while :; do
-    bal=$(nd_q bank balances "$addr" | jq -r --arg d "$DENOM" '[.balances[]? | select(.denom == $d) | .amount | tonumber] | add // 0' 2>/dev/null || echo 0)
+    bal=$(chain_q "/cosmos/bank/v1beta1/balances/$addr" bank balances "$addr" | jq -r --arg d "$DENOM" '[.balances[]? | select(.denom == $d) | .amount | tonumber] | add // 0' 2>/dev/null || echo 0)
     [[ $bal =~ ^[0-9]+$ ]] || bal=0
     say "  address  ${B}$addr${R}"
     say "  balance  $(awk -v b="$bal" 'BEGIN { printf "%.6f", b / 1e6 }') HUAHUA"

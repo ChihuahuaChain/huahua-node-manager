@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.4 (2026-10-10)
+
+- Fix: with nodes of several users on the machine, the dashboard could mix them up. The detection took the first `chihuahuad` process it found, even one of another user whose configuration it could not read; it then fell back to the default RPC port, which belonged to this user's node. The result showed this user's node name and state with the other user's directory and binary ("Permission denied" in place of the version, validator not detected). The detection now prefers this user's nodes, and skips another user's node when its configuration cannot be read.
+- Chain queries no longer depend on running the node binary: when this user cannot run it (a node of another user, a Docker image), the upgrade plan, the proposals in voting, the validator state, the validator names of the Consensus view, balances and transactions are read from the node's REST API when it is on, else from the public REST APIs (`HUAHUA_REST_APIS`). The consensus key comes from the node's RPC. The version comes from `/abci_info` when the binary cannot be run.
+- The Consensus view shows the validator name alone; the address only when the name is unknown.
+
 ## 0.3.3 (2026-10-10)
 
 ### Fixes
