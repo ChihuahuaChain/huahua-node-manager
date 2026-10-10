@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION=0.3.5
+SCRIPT_VERSION=0.3.6
 CHAIN_ID=chihuahua-1
 DENOM=uhuahua
 DAEMON=chihuahuad
@@ -269,12 +269,30 @@ chain_get() {
 # directory is given explicitly so the CLI never creates a stray ~/.chihuahuad.
 nd_q() { nd q "$@" -o json --home "$NODE_HOME" "$(node_flag)" 2>/dev/null; }
 # chain_q <REST path> <CLI query...>: the same query through the binary when
-# this user can run it (the node answers), through REST otherwise. The two
-# give the same JSON for the queries used here.
+# this user can run it, through REST when it cannot or when the binary
+# query fails (a flag that changed between SDK versions, for instance). The
+# two give the same JSON for the queries used here.
 chain_q() {
-  local path=$1; shift
-  if bin_ok; then nd_q "$@"; else chain_get "$path"; fi
+  local path=$1 out; shift
+  if bin_ok && out=$(nd_q "$@") && [ -n "$out" ] && jq -e . >/dev/null 2>&1 <<< "$out"; then printf '%s' "$out"
+  else chain_get "$path"; fi
 }
+# bonded_validators: the bonded validator set as JSON ({"validators": [...]}).
+# The pagination flags differ between SDK versions (--page-limit from 0.50,
+# --limit before), so both are tried before REST.
+bonded_validators() {
+  local out
+  if bin_ok; then
+    for out in "$(nd_q staking validators --status BOND_STATUS_BONDED --page-limit 1000 || true)" \
+               "$(nd_q staking validators --limit 1000 || true)"; do
+      [ -n "$out" ] && jq -e '.validators' >/dev/null 2>&1 <<< "$out" && { printf '%s' "$out"; return 0; }
+    done
+  fi
+  chain_get '/cosmos/staking/v1beta1/validators?status=BOND_STATUS_BONDED&pagination.limit=1000'
+}
+# the consensus key of a validator entry: {"@type", key} in proto JSON,
+# {type, value} in the CLI output of SDK 0.50
+JQ_CONS_KEY='(.consensus_pubkey.key // .consensus_pubkey.value)'
 # upgrade_plan: "<name>\t<height>" of the upgrade scheduled on chain, or nothing
 upgrade_plan() {
   chain_q /cosmos/upgrade/v1beta1/current_plan upgrade plan |
@@ -340,8 +358,11 @@ validator_info() {
   local pk key sign val
   pk=$(validator_pubkey) || return 0
   key=$(jq -r '.key // empty' <<< "$pk" 2>/dev/null); [ -n "$key" ] || return 0
-  val=$(chain_q '/cosmos/staking/v1beta1/validators?pagination.limit=1000' staking validators --limit 1000 | jq -r --arg k "$key" '
-    .validators[]? | select(.consensus_pubkey.key == $k) | "\(.jailed)\t\(.status)\t\(.operator_address)"' 2>/dev/null || true)
+  val=$(bonded_validators | jq -r --arg k "$key" "
+    .validators[]? | select($JQ_CONS_KEY == \$k) | \"\\(.jailed // false)\\t\\(.status)\\t\\(.operator_address)\"" 2>/dev/null || true)
+  # not bonded (jailed, or out of the active set): look through the whole set
+  [ -n "$val" ] || val=$(chain_get '/cosmos/staking/v1beta1/validators?pagination.limit=1000' | jq -r --arg k "$key" "
+    .validators[]? | select($JQ_CONS_KEY == \$k) | \"\\(.jailed // false)\\t\\(.status)\\t\\(.operator_address)\"" 2>/dev/null || true)
   [ -n "$val" ] || return 0
   sign=$(chain_q "/cosmos/slashing/v1beta1/signing_infos/$(bech32_encode chihuahuavalcons "$(cons_address_of "$key" | tr A-F a-f)")" \
       slashing signing-info "$pk" | jq -r '(.val_signing_info // .) |
@@ -368,8 +389,8 @@ refresh_validator_names() {
     # printable ASCII only: emoji and wide characters would break the layout
     moniker=$(printf '%s' "$moniker" | tr -cd '\40-\176' | tr -s ' ' | sed 's/^ *//; s/ *$//')
     printf '%s\t%s\n' "$addr" "${moniker:-?}" >> "$tmp"
-  done < <(chain_q '/cosmos/staking/v1beta1/validators?status=BOND_STATUS_BONDED&pagination.limit=1000' staking validators --limit 1000 |
-    jq -r '.validators[]? | select(.status == "BOND_STATUS_BONDED") | "\(.consensus_pubkey.key)\t\(.description.moniker)"' 2>/dev/null || true)
+  done < <(bonded_validators |
+    jq -r ".validators[]? | select(.status == \"BOND_STATUS_BONDED\") | \"\\($JQ_CONS_KEY)\\t\\(.description.moniker)\"" 2>/dev/null || true)
   if [ -s "$tmp" ]; then mv -f "$tmp" "$VALIDATORS_FILE"; else rm -f "$tmp"; fi
 }
 declare -A VNAME
@@ -2051,6 +2072,8 @@ tui_body() {
           "  ${D}voting power${R}   ${T_VP:-0}"
           "  ${D}missed blocks${R}  ${T_V_MISSED:-0}  ${D}(in the current signing window)${R}")
         [ "${T_V_TOMB:-false}" = true ] && BODY+=("  ${RED}tombstoned: this consensus key can never validate again${R}")
+      elif [ "${T_VP:-0}" != 0 ]; then
+        BODY+=("" "  ${D}voting power${R}  $T_VP" "  ${D}status${R}        ${GRN}active validator${R}  ${D}(details not available: the staking query did not answer)${R}")
       else
         BODY+=("" "  ${D}voting power${R}  ${T_VP:-0}" "  ${D}status${R}        not a validator")
         [ -n "${T_UP:-}" ] || BODY+=("" "  ${YEL}the node is not running${R}")

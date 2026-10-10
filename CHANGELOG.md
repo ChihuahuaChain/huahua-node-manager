@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.6 (2026-10-10)
+
+- Fix: the Validator tab and `huahua-node status` said "not a validator" for a validator running chihuahuad v10. The staking query through the binary failed silently: SDK 0.50 replaced the `--limit` flag with `--page-limit`, and writes the consensus key as `{type, value}` instead of `{@type, key}`. Both forms are handled, and a failing binary query falls back to the REST API. A validator out of the active set (jailed, unbonded) is looked up through the whole set.
+- When the voting power is known but the staking details are not, the Validator tab says "active validator" rather than "not a validator".
+
 ## 0.3.5 (2026-10-10)
 
 - The manager only looks at the nodes of the user running it. Another user's node, even when readable, is no longer picked up: run `huahua-node` as that user to manage it.
